@@ -31,7 +31,6 @@ function hashWithBits(...bits) {
 function tracker(options = {}) {
     return window.DuplicateImageGroups.createTracker({
         threshold: 5,
-        distance: hammingDistance,
         maxCacheEntries: 100,
         maxFailedEntries: 100,
         ...options
@@ -159,7 +158,8 @@ test('eviction drops a hash node once no URL uses it', () => {
     t.recordHash('x', { hash: A, solid: false });
     t.recordHash('y', { hash: FAR, solid: false });
     show(t);
-    assert.deepEqual({ ...t.stats() }, { cached: 1, hashes: 1, bands: 6, pending: 0, failed: 0 });
+    const { comparisons, ...rest } = t.stats();
+    assert.deepEqual(rest, { cached: 1, hashes: 1, bands: 6, pending: 0, failed: 0 });
     // The evicted node must no longer link anything: a later B matches nothing on the page.
     show(t, 'b', 'y');
     t.recordHash('b', { hash: B, solid: false });
@@ -169,12 +169,13 @@ test('eviction drops a hash node once no URL uses it', () => {
 test('evicting a hash removes it from the band index', () => {
     const t = tracker({ maxCacheEntries: 1 });
     show(t, 'a');
-    // one differing bit in each of the six bands: shares no band with A
-    t.recordHash('far', { hash: hashWithBits(0, 170, 340, 510, 680, 850), solid: false });
+    // one differing bit in each of the six bands (bit p is in band p mod 6): shares no band with A
+    t.recordHash('far', { hash: hashWithBits(0, 1, 2, 3, 4, 5), solid: false });
     t.recordHash('a', { hash: A, solid: false });
     assert.equal(t.stats().bands, 12);
     show(t, 'a'); // 'far' is evicted
-    assert.deepEqual({ ...t.stats() }, { cached: 1, hashes: 1, bands: 6, pending: 0, failed: 0 });
+    const { comparisons, ...rest } = t.stats();
+    assert.deepEqual(rest, { cached: 1, hashes: 1, bands: 6, pending: 0, failed: 0 });
 });
 
 test('groups are rebuilt correctly after the image joining them is evicted, and rejoin when it returns', () => {
@@ -267,15 +268,19 @@ test('re-injecting the module keeps the first instance', () => {
     assert.equal(win.DuplicateImageGroups, first);
 });
 
-// Counts calls to the distance function.
+// Deterministic pseudo-random numbers in [0, 1) (mulberry32).
+function seededRandom(seed) {
+    return () => {
+        seed = (seed + 0x6D2B79F5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
 function countingTracker(options = {}) {
-    const counter = { calls: 0 };
-    const t = tracker({
-        maxCacheEntries: 10000,
-        distance: (a, b, limit) => { counter.calls++; return hammingDistance(a, b, limit); },
-        ...options
-    });
-    return { t, counter };
+    const t = tracker({ maxCacheEntries: 10000, ...options });
+    return { t, counter: { get calls() { return t.stats().comparisons; } } };
 }
 
 test('a large cluster of near-identical images costs about one comparison per image', () => {
@@ -294,8 +299,7 @@ test('a large cluster of near-identical images costs about one comparison per im
 
 test('unrelated images are not compared at all', () => {
     const { t, counter } = countingTracker();
-    let seed = 1;
-    const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const random = seededRandom(1);
     const srcs = Array.from({ length: 2000 }, (_, i) => `u${i}`);
     show(t, ...srcs);
     for (const src of srcs) {
@@ -306,11 +310,47 @@ test('unrelated images are not compared at all', () => {
     assert.ok(counter.calls < 50, `${counter.calls} comparisons`);
 });
 
-test('bands catch a match whose differing bits are spread across the hash', () => {
-    const t = tracker();
-    show(t, 'x', 'y');
-    // 5 bits apart, one in each of five different bands
-    t.recordHash('x', { hash: A, solid: false });
-    t.recordHash('y', { hash: hashWithBits(0, 170, 340, 510, 680), solid: false });
-    assert.deepEqual(groupsOf(t), [['x', 'y']]);
+test('bands catch a match whose differing bits fall in five different bands', () => {
+    for (const bits of [[0, 1, 2, 3, 4], [0, 170, 340, 511, 683], [987, 988, 989, 990, 991]]) {
+        const t = tracker();
+        show(t, 'x', 'y');
+        t.recordHash('x', { hash: A, solid: false });
+        t.recordHash('y', { hash: hashWithBits(...bits), solid: false });
+        assert.deepEqual(groupsOf(t), [['x', 'y']], `bits ${bits}`);
+    }
+});
+
+test('matches exactly when at most 5 bits differ, wherever they are', () => {
+    const random = seededRandom(3);
+    const randomHash = () => Array.from({ length: HASH_LENGTH }, () => Math.floor(random() * 16).toString(16)).join('');
+    for (let trial = 0; trial < 300; trial++) {
+        const base = randomHash();
+        const flips = trial % 11; // 0..10 differing bits
+        const positions = new Set();
+        while (positions.size < flips) positions.add(Math.floor(random() * HASH_LENGTH * 4));
+        const nibbles = [...base].map((c) => parseInt(c, 16));
+        for (const p of positions) nibbles[p >> 2] ^= 8 >> (p & 3);
+        const other = nibbles.map((n) => n.toString(16)).join('');
+        assert.equal(hammingDistance(base, other), flips);
+
+        const t = tracker();
+        show(t, 'x', 'y');
+        t.recordHash('x', { hash: base, solid: false });
+        t.recordHash('y', { hash: other, solid: false });
+        assert.equal(groupsOf(t).length, flips <= 5 ? 1 : 0, `${flips} bits at ${[...positions]}`);
+    }
+});
+
+test('images that share a flat background are not compared with each other', () => {
+    const { t, counter } = countingTracker();
+    const random = seededRandom(5);
+    const srcs = Array.from({ length: 2000 }, (_, i) => `p${i}`);
+    show(t, ...srcs);
+    for (const src of srcs) {
+        // top third of the hash identical (flat rows), the rest unrelated
+        const hash = '0'.repeat(80) + Array.from({ length: HASH_LENGTH - 80 }, () => Math.floor(random() * 16).toString(16)).join('');
+        t.recordHash(src, { hash, solid: false });
+    }
+    assert.equal(t.groups().groups.length, 0);
+    assert.ok(counter.calls < 50, `${counter.calls} comparisons`);
 });

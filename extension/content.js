@@ -134,7 +134,6 @@
 
     const tracker = DuplicateImageGroups.createTracker({
         threshold: HAMMING_THRESHOLD,
-        distance: DuplicateImageHash.hammingDistance,
         maxCacheEntries: MAX_CACHE_ENTRIES,
         maxFailedEntries: MAX_FAILED_ENTRIES
     });

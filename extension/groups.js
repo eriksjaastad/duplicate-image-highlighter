@@ -12,11 +12,14 @@
  *   connected when their hashes differ by at most `threshold` bits. A~B and
  *   B~C put A, B and C in one group whatever order they were hashed in.
  *
- * No pairwise links are stored. Each hash is split into threshold + 1 bands:
- * two hashes within `threshold` bits must agree exactly on at least one band
- * (pigeonhole), so a band index finds every possible match without comparing
- * unrelated images. The union-find over images on the page is kept between
- * calls, extended as hashes arrive, and rebuilt only when an image leaves.
+ * No pairwise links are stored. Each hash's bits are dealt into threshold + 1
+ * bands (bit p goes to band p mod bands): two hashes within `threshold` bits
+ * must agree exactly on at least one band (pigeonhole), so a band index finds
+ * every possible match. Dealing the bits, rather than cutting the hash into
+ * runs, spreads each band over the whole picture: images that merely share a
+ * flat background (identical rows of the hash) do not share a band. The
+ * union-find over images on the page is kept between calls, extended as hashes
+ * arrive, and rebuilt only when an image leaves.
  */
 (function () {
     // Clicking the toolbar button again re-injects this file; keep the first instance.
@@ -24,12 +27,11 @@
 
     /**
      * @param {object} options
-     * @param {number} options.threshold - max differing bits for two hashes to match
-     * @param {function} options.distance - (hashA, hashB, limit) -> differing bits
+     * @param {number} options.threshold - max differing bits for two hex hashes to match
      * @param {number} options.maxCacheEntries - cache size before evicting URLs no longer on the page
      * @param {number} options.maxFailedEntries - failed URLs remembered before forgetting the oldest half
      */
-    function createTracker({ threshold, distance, maxCacheEntries, maxFailedEntries }) {
+    function createTracker({ threshold, maxCacheEntries, maxFailedEntries }) {
         // element -> URL it shows, as of the last sync()
         let elements = new Map();
         // URLs shown by at least one element, as of the last sync()
@@ -37,7 +39,8 @@
 
         // URL -> { node } for a hashed image, or { skip: true } for one never compared
         const cache = new Map();
-        // hash -> { hash, srcs: Set of cached URLs with this exact hash, bands: band keys }
+        // hash -> { hash, words: the hash as 32-bit words, srcs: Set of cached URLs
+        //          with this exact hash, bands: band keys }
         const nodes = new Map();
         // band key -> Set of nodes with that band
         const bandIndex = new Map();
@@ -47,6 +50,8 @@
         // bumping `round` empties the union in O(1).
         let round = 0;
         let members = new Set();
+        // Hash comparisons made so far (stats, tests)
+        let comparisons = 0;
         // URLs being hashed now
         const pending = new Set();
         // URLs that failed to hash, oldest first (a rescan retries them)
@@ -110,7 +115,7 @@
         function nodeFor(hash, src) {
             let node = nodes.get(hash);
             if (!node) {
-                node = { hash, srcs: new Set(), bands: bandsOf(hash), round: -1, up: null };
+                node = { hash, words: wordsOf(hash), srcs: new Set(), bands: bandsOf(hash), round: -1, up: null };
                 for (const band of node.bands) {
                     if (!bandIndex.has(band)) bandIndex.set(band, new Set());
                     bandIndex.get(band).add(node);
@@ -121,11 +126,49 @@
             return node;
         }
 
+        // Band keys: bit p of the hash goes to band p mod bandCount; each band's
+        // bits are packed back into hex.
         function bandsOf(hash) {
-            const size = Math.ceil(hash.length / bandCount);
-            const bands = [];
-            for (let i = 0; i < bandCount; i++) bands.push(`${i}:${hash.slice(i * size, (i + 1) * size)}`);
-            return bands;
+            const bits = [];
+            for (let i = 0; i < bandCount; i++) bits.push([]);
+            for (let c = 0; c < hash.length; c++) {
+                const nibble = parseInt(hash[c], 16);
+                for (let k = 0; k < 4; k++) {
+                    const p = c * 4 + k;
+                    bits[p % bandCount].push((nibble >> (3 - k)) & 1);
+                }
+            }
+            return bits.map((band, i) => {
+                let hex = '';
+                for (let j = 0; j < band.length; j += 4) {
+                    hex += ((band[j] << 3) | ((band[j + 1] || 0) << 2) | ((band[j + 2] || 0) << 1) | (band[j + 3] || 0)).toString(16);
+                }
+                return `${i}:${hex}`;
+            });
+        }
+
+        function wordsOf(hash) {
+            const words = new Uint32Array(Math.ceil(hash.length / 8));
+            for (let i = 0; i < words.length; i++) {
+                words[i] = parseInt(hash.slice(i * 8, i * 8 + 8).padEnd(8, '0'), 16);
+            }
+            return words;
+        }
+
+        // Differing bits between two nodes' hashes; stops counting once past
+        // `limit`. Hashes of different lengths never match.
+        function distance(a, b, limit) {
+            comparisons++;
+            if (a.hash.length !== b.hash.length) return Infinity;
+            let d = 0;
+            for (let i = 0; i < a.words.length; i++) {
+                let x = a.words[i] ^ b.words[i];
+                x -= (x >>> 1) & 0x55555555;
+                x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+                d += (Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24);
+                if (d > limit) return d;
+            }
+            return d;
         }
 
         // Drop a URL from the cache, and its hash node once no URL uses it.
@@ -230,13 +273,13 @@
                     const a = find(node);
                     const b = find(other);
                     if (a === b) continue;
-                    if (distance(node.hash, other.hash, threshold) <= threshold) a.up = b;
+                    if (distance(node, other, threshold) <= threshold) a.up = b;
                 }
             }
         }
 
         function stats() {
-            return { cached: cache.size, hashes: nodes.size, bands: bandIndex.size, pending: pending.size, failed: failed.size };
+            return { cached: cache.size, hashes: nodes.size, bands: bandIndex.size, comparisons, pending: pending.size, failed: failed.size };
         }
 
         return { sync, entries, needsHash, markPending, recordHash, recordSkip, retryFailed, groups, stats };

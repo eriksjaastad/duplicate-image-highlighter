@@ -37,7 +37,7 @@ class FakeImg {
     addEventListener() {}
 }
 
-// Loads hash.js (for hammingDistance), groups.js and content.js into one fake page.
+// Loads groups.js and content.js into one fake page, with hashing stubbed.
 function loadPage(images, hashes) {
     const page = { images: [...images], timers: new Map(), nextTimer: 1, messages: [], observed: new Set(), observeCalls: 0, hashed: [], held: new Map() };
 
@@ -73,11 +73,8 @@ function loadPage(images, hashes) {
         }
     };
     vm.createContext(context);
-    vm.runInContext(read('hash.js'), context);
-    // Replace fetching and decoding with fixed hashes per URL.
-    const realHash = window.DuplicateImageHash;
+    // Stands in for hash.js: fixed hashes per URL instead of fetching and decoding.
     window.DuplicateImageHash = {
-        hammingDistance: realHash.hammingDistance,
         pendingCount: () => 0,
         queueHash: (src) => {
             page.hashed.push(src);
