@@ -81,7 +81,9 @@
     // correctly clipped, layered and in place through scrolling and animation.
     // Each property's previous inline value is saved and restored on clear.
 
-    const OUTLINE_PROPS = ['outline', 'outline-offset'];
+    // Longhands, not the `outline` shorthand: a page may set just one of them
+    // inline (say outline-color), which the shorthand cannot read back.
+    const OUTLINE_PROPS = ['outline-width', 'outline-style', 'outline-color', 'outline-offset'];
 
     // img element -> { count, props: { [prop]: { value, priority, applied } } }
     // value/priority: the page's inline value to restore; applied: what we set
@@ -119,7 +121,9 @@
             decorations.set(img, entry);
         }
         const wanted = {
-            'outline': `4px solid ${colorForCount(count)}`,
+            'outline-width': '4px',
+            'outline-style': 'solid',
+            'outline-color': colorForCount(count),
             'outline-offset': '-4px'
         };
         for (const prop of OUTLINE_PROPS) {

@@ -15,12 +15,34 @@ const HASH_LOW = '0'.repeat(HASH_LENGTH);
 const HASH_HIGH = 'f'.repeat(HASH_LENGTH);
 const HASH_MID = '5'.repeat(HASH_LENGTH);
 
+// Inline style with the CSSOM's shorthand rules for `outline`: setting it sets
+// its three longhands, and it reads back only when all three are set with the
+// same priority.
+const OUTLINE_LONGHANDS = ['outline-width', 'outline-style', 'outline-color'];
+
 class FakeStyle {
     constructor() { this.props = new Map(); }
-    setProperty(prop, value, priority = '') { this.props.set(prop, { value, priority }); }
-    getPropertyValue(prop) { return this.props.get(prop)?.value ?? ''; }
-    getPropertyPriority(prop) { return this.props.get(prop)?.priority ?? ''; }
-    removeProperty(prop) { this.props.delete(prop); }
+    setProperty(prop, value, priority = '') {
+        if (prop !== 'outline') {
+            this.props.set(prop, { value, priority });
+            return;
+        }
+        const [, width, style, color] = value.match(/^(\S+)\s+(\S+)\s+(.+)$/);
+        [width, style, color].forEach((v, i) => this.props.set(OUTLINE_LONGHANDS[i], { value: v, priority }));
+    }
+    getPropertyValue(prop) {
+        if (prop !== 'outline') return this.props.get(prop)?.value ?? '';
+        const parts = OUTLINE_LONGHANDS.map((p) => this.props.get(p));
+        if (parts.some((p) => !p) || new Set(parts.map((p) => p.priority)).size > 1) return '';
+        return parts.map((p) => p.value).join(' ');
+    }
+    getPropertyPriority(prop) {
+        if (prop !== 'outline') return this.props.get(prop)?.priority ?? '';
+        return this.getPropertyValue('outline') ? this.props.get('outline-width').priority : '';
+    }
+    removeProperty(prop) {
+        for (const p of prop === 'outline' ? OUTLINE_LONGHANDS : [prop]) this.props.delete(p);
+    }
 }
 
 class FakeImg {
@@ -408,4 +430,16 @@ test('the badge keeps updating while hashes keep arriving', async () => {
     await page.settle();
     assert.equal(page.cleared, 0, 'a pending badge update is never pushed back');
     assert.equal(page.badge(), 1);
+});
+
+test('a page that sets only one outline longhand gets exactly that back', async () => {
+    const a1 = new FakeImg('https://x.example/a1.png');
+    const a2 = new FakeImg('https://x.example/a2.png');
+    a1.style.setProperty('outline-color', 'red');
+    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW });
+    await page.settle();
+    assert.equal(outlined(a1), true);
+    page.remove(a2);
+    await page.changed();
+    assert.deepEqual([...a1.style.props.entries()], [['outline-color', { value: 'red', priority: '' }]]);
 });

@@ -400,3 +400,13 @@ test('when an image leaves, only its own group is re-checked', () => {
     assert.equal(t.groups().sizeBySrc.get('n1'), 299);
     assert.ok(counter.calls - before < 2 * 300, `${counter.calls - before} comparisons`);
 });
+
+test('a candidate sharing several bands is compared once per arrival', () => {
+    const { t, counter } = countingTracker();
+    show(t, 'x', 'y');
+    t.recordHash('x', { hash: A, solid: false });
+    // 6 bits apart, all in band 0 (bit p is in band p mod 6): shares the other five bands
+    t.recordHash('y', { hash: hashWithBits(0, 6, 12, 18, 24, 30), solid: false });
+    assert.deepEqual(groupsOf(t), []);
+    assert.equal(counter.calls, 1);
+});

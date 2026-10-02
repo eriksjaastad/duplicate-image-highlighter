@@ -128,7 +128,7 @@
         function nodeFor(hash, src) {
             let node = nodes.get(hash);
             if (!node) {
-                node = { hash, words: wordsOf(hash), srcs: new Set(), bands: bandsOf(hash), joined: false, up: null, group: null };
+                node = { hash, words: wordsOf(hash), srcs: new Set(), bands: bandsOf(hash), joined: false, up: null, group: null, visited: 0 };
                 for (const band of node.bands) {
                     if (!bandIndex.has(band)) bandIndex.set(band, new Set());
                     bandIndex.get(band).add(node);
@@ -273,14 +273,20 @@
 
         // Join a node to every node on the page that shares a band with it and
         // is within the threshold, skipping ones already in its group.
+        // Bumped per addToUnion call: a candidate seen through several shared
+        // bands is still considered only once.
+        let visit = 0;
+
         function addToUnion(node) {
             node.joined = true;
             node.up = node;
             node.group = [node];
             members.add(node);
+            visit++;
             for (const band of node.bands) {
                 for (const other of bandIndex.get(band)) {
-                    if (other === node || !other.joined) continue;
+                    if (other === node || !other.joined || other.visited === visit) continue;
+                    other.visited = visit;
                     const a = find(node);
                     const b = find(other);
                     if (a === b) continue;
