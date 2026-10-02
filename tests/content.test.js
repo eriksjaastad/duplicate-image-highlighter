@@ -31,6 +31,7 @@ class FakeImg {
         this.naturalWidth = width;
         this.naturalHeight = height;
         this.style = new FakeStyle();
+        this.tagName = 'IMG';
     }
     setSrc(src) { this.src = src; this.currentSrc = src; }
     addEventListener() {}
@@ -38,12 +39,13 @@ class FakeImg {
 
 // Loads hash.js (for hammingDistance), groups.js and content.js into one fake page.
 function loadPage(images, hashes) {
-    const page = { images: [...images], timers: new Map(), nextTimer: 1, messages: [], observed: new Set(), observeCalls: 0, hashed: [] };
+    const page = { images: [...images], timers: new Map(), nextTimer: 1, messages: [], observed: new Set(), observeCalls: 0, hashed: [], held: new Map() };
 
     const window = {
         addEventListener: () => {}
     };
     const document = {
+        addEventListener: (type, fn, capture) => { if (type === 'load' && capture) page.onLoadCapture = fn; },
         createElement: () => ({ getContext: () => ({}) }),
         documentElement: {},
         querySelectorAll: (selector) => (selector === 'img' ? [...page.images] : [])
@@ -79,7 +81,9 @@ function loadPage(images, hashes) {
         pendingCount: () => 0,
         queueHash: (src) => {
             page.hashed.push(src);
-            return Promise.resolve(src in hashes ? { hash: hashes[src], solid: false } : null);
+            const result = () => (src in hashes ? { hash: hashes[src], solid: false } : null);
+            if (!page.held.has(src)) return Promise.resolve(result());
+            return new Promise((resolve) => page.held.set(src, () => resolve(result())));
         }
     };
     vm.runInContext(read('groups.js'), context);
@@ -101,6 +105,14 @@ function loadPage(images, hashes) {
     // What the page does after a DOM change: the mutation observer fires.
     page.changed = async () => {
         page.mutate();
+        await page.settle();
+    };
+    // A hash for this URL stays in flight until release(src).
+    page.hold = (src) => page.held.set(src, null);
+    page.release = (src) => { const done = page.held.get(src); page.held.delete(src); done(); };
+    // The browser finished loading an image (no DOM mutation involved).
+    page.loaded = async (img) => {
+        page.onLoadCapture({ target: img });
         await page.settle();
     };
     page.badge = () => page.messages.filter((m) => m.action === 'SCAN_STATUS').at(-1)?.groups;
@@ -245,4 +257,51 @@ test('clicking again retries an image that failed', async () => {
     await page.settle();
     assert.equal(outlined(a1), true);
     assert.equal(outlined(a2), true);
+});
+
+test('an image whose currentSrc changes on load, with no DOM change, is regrouped', async () => {
+    const a1 = new FakeImg('https://x.example/a1.png');
+    const lazy = new FakeImg('https://x.example/placeholder.png');
+    const page = loadPage([a1, lazy], {
+        [a1.src]: HASH_LOW,
+        'https://x.example/placeholder.png': HASH_HIGH,
+        'https://x.example/a2-800w.png': HASH_LOW
+    });
+    await page.settle();
+    assert.equal(outlined(a1), false);
+
+    lazy.currentSrc = 'https://x.example/a2-800w.png'; // srcset candidate picked; src attribute unchanged
+    await page.loaded(lazy);
+    assert.equal(outlined(a1), true);
+    assert.equal(outlined(lazy), true);
+    assert.equal(page.badge(), 1);
+});
+
+test('a hash that resolves after its image was removed does not outline anything', async () => {
+    const a1 = new FakeImg('https://x.example/a1.png');
+    const a2 = new FakeImg('https://x.example/a2.png');
+    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW });
+    page.hold(a2.src);
+    await page.settle();
+    page.images = [a1];
+    await page.changed();
+    page.release(a2.src);
+    await page.settle();
+    assert.equal(outlined(a1), false);
+    assert.equal(page.badge(), 0);
+});
+
+test('a hash that resolves after its image changed src does not outline the new image', async () => {
+    const a1 = new FakeImg('https://x.example/a1.png');
+    const a2 = new FakeImg('https://x.example/a2.png');
+    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW, 'https://x.example/u.png': HASH_HIGH });
+    page.hold(a2.src);
+    await page.settle();
+    a2.setSrc('https://x.example/u.png');
+    await page.changed();
+    page.release('https://x.example/a2.png');
+    await page.settle();
+    assert.equal(outlined(a1), false);
+    assert.equal(outlined(a2), false);
+    assert.equal(page.badge(), 0);
 });

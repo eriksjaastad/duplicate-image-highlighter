@@ -51,7 +51,8 @@
     const MAX_FAILED_ENTRIES = 1000;
 
     /**
-     * DOM changes are handled at most this often (ms), however busy the page is.
+     * DOM changes and image loads are handled at most this often (ms), however
+     * busy the page is.
      */
     const MUTATION_INTERVAL = 500;
 
@@ -320,17 +321,26 @@
         }
     });
 
-    // --- DOM CHANGES (infinite scroll, SPAs, lazy src swaps) ---
+    // --- PAGE CHANGES (infinite scroll, SPAs, lazy src swaps) ---
 
     // Throttled, not debounced: a page that never stops changing still gets scanned.
-    let mutationTimer = null;
-    const domObserver = new MutationObserver(() => {
-        if (mutationTimer !== null) return;
-        mutationTimer = setTimeout(() => {
-            mutationTimer = null;
+    let scanTimer = null;
+    function scheduleScan() {
+        if (scanTimer !== null) return;
+        scanTimer = setTimeout(() => {
+            scanTimer = null;
             scanPage();
         }, MUTATION_INTERVAL);
-    });
+    }
+
+    const domObserver = new MutationObserver(scheduleScan);
+
+    // An image can switch URL without any DOM change: a lazy or srcset image
+    // resolves currentSrc when it loads, and a resize can pick another srcset
+    // candidate. Each of those fires 'load' (which does not bubble, so capture).
+    document.addEventListener('load', (e) => {
+        if (e.target.tagName === 'IMG') scheduleScan();
+    }, true);
 
     domObserver.observe(document.documentElement, {
         childList: true,

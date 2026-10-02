@@ -7,7 +7,7 @@
  *   replaced wholesale on every page scan, so removed images and changed srcs
  *   drop out.
  * - Cache: URL -> hash (or "skip" for solid-color and too-small images).
- *   Bounded; URLs still shown on the page are never evicted.
+ *   Trimmed on every sync; URLs still shown on the page are never evicted.
  * - Groups: connected components of the URLs on the page, where two URLs are
  *   connected when their hashes differ by at most `threshold` bits. A~B and
  *   B~C put A, B and C in one group whatever order they were hashed in.
@@ -45,6 +45,7 @@
         function sync(entries) {
             elements = new Map(entries);
             liveSrcs = new Set(elements.values());
+            evict();
         }
 
         function entries() {
@@ -78,7 +79,6 @@
             }
             forget(src);
             cache.set(src, { node: nodeFor(result.hash, src) });
-            evict();
         }
 
         /**
@@ -87,7 +87,6 @@
         function recordSkip(src) {
             forget(src);
             cache.set(src, { skip: true });
-            evict();
         }
 
         function retryFailed() {
@@ -124,6 +123,7 @@
         }
 
         // Evict the oldest URLs no longer on the page until the cache fits.
+        // Runs on sync(), when the set of URLs on the page is fresh.
         function evict() {
             if (cache.size <= maxCacheEntries) return;
             for (const src of cache.keys()) {

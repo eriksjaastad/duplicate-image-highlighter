@@ -143,6 +143,8 @@ test('eviction keeps URLs still on the page, and they keep grouping', () => {
     t.recordHash('live1', { hash: A, solid: false });
     t.recordHash('live2', { hash: A, solid: false });
     for (let i = 0; i < 5; i++) t.recordHash(`gone${i}`, { hash: hashWithBits(500 + i * 40, 501 + i * 40, 502 + i * 40, 503 + i * 40, 504 + i * 40, 505 + i * 40), solid: false });
+    assert.equal(t.stats().cached, 7, 'eviction waits for the next sync');
+    show(t, 'live1', 'live2');
 
     assert.equal(t.stats().cached, 3);
     assert.equal(t.needsHash('live1'), false);
@@ -156,6 +158,7 @@ test('eviction drops a hash node once no URL uses it', () => {
     show(t);
     t.recordHash('x', { hash: A, solid: false });
     t.recordHash('y', { hash: FAR, solid: false });
+    show(t);
     assert.deepEqual({ ...t.stats() }, { cached: 1, hashes: 1, links: 0, pending: 0, failed: 0 });
     // The evicted node must no longer link anything: a later B matches nothing on the page.
     show(t, 'b', 'y');
@@ -169,8 +172,20 @@ test('evicting a hash unlinks it from its look-alikes', () => {
     t.recordHash('old', { hash: C, solid: false });
     t.recordHash('a', { hash: A, solid: false });
     assert.equal(t.stats().links, 0);
-    t.recordHash('b', { hash: B, solid: false }); // links to A and C, then C is evicted
+    t.recordHash('b', { hash: B, solid: false }); // links to A and C
+    assert.equal(t.stats().links, 2);
+    show(t, 'a', 'b'); // C is evicted
     assert.deepEqual({ ...t.stats() }, { cached: 2, hashes: 2, links: 1, pending: 0, failed: 0 });
+});
+
+test('a URL hashed since the last sync survives the next eviction if it is on the page', () => {
+    const t = tracker({ maxCacheEntries: 1 });
+    show(t, 'old');
+    t.recordHash('old', { hash: A, solid: false });
+    t.recordHash('new', { hash: FAR, solid: false }); // its element changed src after the last sync
+    show(t, 'new');
+    assert.equal(t.needsHash('new'), false);
+    assert.equal(t.needsHash('old'), true);
 });
 
 test('the cache may exceed its limit rather than evict URLs on the page', () => {
@@ -178,6 +193,7 @@ test('the cache may exceed its limit rather than evict URLs on the page', () => 
     show(t, 'a1', 'a2');
     t.recordHash('a1', { hash: A, solid: false });
     t.recordHash('a2', { hash: A, solid: false });
+    show(t, 'a1', 'a2');
     assert.equal(t.stats().cached, 2);
     assert.deepEqual(groupsOf(t), [['a1', 'a2']]);
 });

@@ -5,7 +5,7 @@
 First public release.
 
 - Highlights duplicate and near-duplicate `<img>` elements on the current page using a 32×32 difference hash and a Hamming-distance threshold of 5.
-- Runs only when you click the toolbar button, in the top frame of that tab; clicking again rescans.
+- Runs only when you click the toolbar button, in the top frame of that tab.
 - Toolbar badge shows progress (`…`), then the number of duplicate groups.
 - Handles lazy-loaded images, infinite scroll and images whose `src` changes after load. Groups are recomputed from the images on the page, so removing or changing an image updates its group, its outline and the toolbar count.
 - Near-matches chain into one group (A like B, B like C), and the result does not depend on the order images are hashed in.
