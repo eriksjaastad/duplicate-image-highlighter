@@ -35,7 +35,7 @@ function loadBackground(fetchImpl, { executeScript, timers = { setTimeout, clear
         }
     }
     vm.runInNewContext(SOURCE, {
-        chrome, fetch: fetchImpl, FileReader, URL, AbortController, Number,
+        chrome, fetch: fetchImpl, FileReader, URL, AbortController, Number, Blob,
         setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout,
         console: { warn() {}, log() {} }
     });
@@ -48,7 +48,7 @@ function imageResponse(bytes, headers = {}) {
         ok: true,
         status: 200,
         headers: { get: (name) => headers[name] ?? (name === 'Content-Type' ? type : null) },
-        blob: async () => new Blob([bytes], { type })
+        body: new Blob([bytes]).stream()
     };
 }
 
@@ -105,7 +105,7 @@ test('refuses an oversized image from Content-Length before reading the body', a
         ok: true,
         status: 200,
         headers: { get: (n) => ({ 'Content-Length': String(50 * 1024 * 1024), 'Content-Type': 'image/png' })[n] ?? null },
-        blob: async () => { bodyRead = true; return new Blob([]); }
+        get body() { bodyRead = true; return new Blob([]).stream(); }
     }));
     const res = await requestImage(listeners, 'https://img.example/huge.png');
     assert.equal(res.success, false);
@@ -119,6 +119,45 @@ test('refuses an oversized body when no Content-Length was sent', async () => {
     const res = await requestImage(listeners, 'https://img.example/big.png');
     assert.equal(res.success, false);
     assert.match(res.error, /too large/);
+});
+
+// A body of 1 MB chunks that never ends, counting what was pulled and whether the fetch was aborted.
+function endlessResponse(headers = {}) {
+    const state = { pulled: 0, aborted: false };
+    const fetchImpl = async (url, opts) => {
+        opts.signal.addEventListener('abort', () => { state.aborted = true; });
+        return {
+            ok: true,
+            status: 200,
+            headers: { get: (n) => ({ 'Content-Type': 'image/png', ...headers })[n] ?? null },
+            body: new ReadableStream({
+                pull(controller) {
+                    state.pulled += 1024 * 1024;
+                    controller.enqueue(new Uint8Array(1024 * 1024));
+                }
+            })
+        };
+    };
+    return { state, fetchImpl };
+}
+
+test('stops downloading a body without Content-Length once it passes the limit', async () => {
+    const { state, fetchImpl } = endlessResponse();
+    const { listeners } = loadBackground(fetchImpl);
+    const res = await requestImage(listeners, 'https://img.example/endless.png');
+    assert.equal(res.success, false);
+    assert.match(res.error, /too large/);
+    assert.equal(state.aborted, true);
+    assert.ok(state.pulled <= 23 * 1024 * 1024, `pulled ${state.pulled} bytes`);
+});
+
+test('stops downloading a body longer than its declared Content-Length', async () => {
+    const { state, fetchImpl } = endlessResponse({ 'Content-Length': '1000' });
+    const { listeners } = loadBackground(fetchImpl);
+    const res = await requestImage(listeners, 'https://img.example/liar.png');
+    assert.equal(res.success, false);
+    assert.match(res.error, /too large/);
+    assert.ok(state.pulled <= 23 * 1024 * 1024, `pulled ${state.pulled} bytes`);
 });
 
 test('reports HTTP errors as failures', async () => {

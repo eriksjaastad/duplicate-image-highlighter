@@ -18,8 +18,8 @@
  * every possible match. Dealing the bits, rather than cutting the hash into
  * runs, spreads each band over the whole picture: images that merely share a
  * flat background (identical rows of the hash) do not share a band. The
- * union-find over images on the page is kept between calls, extended as hashes
- * arrive, and rebuilt only when an image leaves.
+ * union-find over images on the page is kept between calls and extended as
+ * hashes arrive; when an image leaves, only the group it was in is rebuilt.
  */
 (function () {
     // Clicking the toolbar button again re-injects this file; keep the first instance.
@@ -45,11 +45,10 @@
         // band key -> Set of nodes with that band
         const bandIndex = new Map();
         const bandCount = threshold + 1;
-        // Union-find over hash nodes on the page. Each member node carries
-        // `up` (its parent) and `round` (=== round while it is a member);
-        // bumping `round` empties the union in O(1).
-        let round = 0;
-        let members = new Set();
+        // Union-find over hash nodes on the page. A member node has
+        // `joined` set, `up` (its parent), and, while it is a root,
+        // `group` (every member of its group).
+        const members = new Set();
         // Hash comparisons made so far (stats, tests)
         let comparisons = 0;
         // URLs being hashed now
@@ -129,7 +128,7 @@
         function nodeFor(hash, src) {
             let node = nodes.get(hash);
             if (!node) {
-                node = { hash, words: wordsOf(hash), srcs: new Set(), bands: bandsOf(hash), round: -1, up: null };
+                node = { hash, words: wordsOf(hash), srcs: new Set(), bands: bandsOf(hash), joined: false, up: null, group: null };
                 for (const band of node.bands) {
                     if (!bandIndex.has(band)) bandIndex.set(band, new Set());
                     bandIndex.get(band).add(node);
@@ -201,7 +200,7 @@
             }
             nodes.delete(node.hash);
             // Left in `members` on purpose: groups() sees a node that is not on
-            // the page and rebuilds, so nothing still points at a dropped node.
+            // the page and takes its group apart, so nothing still points at it.
         }
 
         // Evict the oldest URLs no longer on the page until the cache fits.
@@ -239,16 +238,13 @@
             }
 
             // A match through an image that has left the page does not count:
-            // when one leaves, start over. Otherwise only add the new ones.
-            for (const node of members) {
-                if (!liveByNode.has(node)) {
-                    round++;
-                    members = new Set();
-                    break;
-                }
+            // take apart each group that lost a member, then add back its
+            // members still on the page along with any new ones.
+            for (const node of [...members]) {
+                if (node.joined && !liveByNode.has(node)) leaveUnion(node);
             }
             for (const node of liveByNode.keys()) {
-                if (node.round !== round) addToUnion(node);
+                if (!node.joined) addToUnion(node);
             }
 
             const byRoot = new Map();
@@ -278,17 +274,37 @@
         // Join a node to every node on the page that shares a band with it and
         // is within the threshold, skipping ones already in its group.
         function addToUnion(node) {
-            node.round = round;
+            node.joined = true;
             node.up = node;
+            node.group = [node];
             members.add(node);
             for (const band of node.bands) {
                 for (const other of bandIndex.get(band)) {
-                    if (other === node || other.round !== round) continue;
+                    if (other === node || !other.joined) continue;
                     const a = find(node);
                     const b = find(other);
                     if (a === b) continue;
-                    if (distance(node, other, threshold) <= threshold) a.up = b;
+                    if (distance(node, other, threshold) <= threshold) merge(a, b);
                 }
+            }
+        }
+
+        // Join two roots, the smaller group under the larger.
+        function merge(a, b) {
+            const [small, large] = a.group.length <= b.group.length ? [a, b] : [b, a];
+            small.up = large;
+            for (const node of small.group) large.group.push(node);
+            small.group = null;
+        }
+
+        // Take apart the group containing `node`; its members are re-added by
+        // groups() if they are still on the page.
+        function leaveUnion(node) {
+            for (const member of find(node).group) {
+                member.joined = false;
+                member.up = null;
+                member.group = null;
+                members.delete(member);
             }
         }
 

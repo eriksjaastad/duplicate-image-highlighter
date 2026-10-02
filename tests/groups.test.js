@@ -354,3 +354,49 @@ test('images that share a flat background are not compared with each other', () 
     assert.equal(t.groups().groups.length, 0);
     assert.ok(counter.calls < 50, `${counter.calls} comparisons`);
 });
+
+// A hash whose every bit p with p % 6 === 0 is clear (band 0 identical for all), random elsewhere.
+function sharedBandHash(random) {
+    const nibbles = Array.from({ length: HASH_LENGTH }, () => Math.floor(random() * 16));
+    for (let p = 0; p < HASH_LENGTH * 4; p += 6) nibbles[p >> 2] &= ~(8 >> (p & 3));
+    return nibbles.map((n) => n.toString(16)).join('');
+}
+
+test('images sharing a band cost one comparison each per arrival, and nothing when one leaves', () => {
+    const { t, counter } = countingTracker();
+    const random = seededRandom(11);
+    const srcs = Array.from({ length: 500 }, (_, i) => `s${i}`);
+    show(t, ...srcs);
+    srcs.forEach((src, i) => {
+        const before = counter.calls;
+        t.recordHash(src, { hash: sharedBandHash(random), solid: false });
+        t.groups();
+        assert.ok(counter.calls - before <= i, `arrival ${i}: ${counter.calls - before} comparisons`);
+    });
+    assert.equal(t.groups().groups.length, 0);
+
+    const before = counter.calls;
+    show(t, ...srcs.slice(1)); // one leaves
+    assert.equal(t.groups().groups.length, 0);
+    assert.equal(counter.calls - before, 0);
+});
+
+test('when an image leaves, only its own group is re-checked', () => {
+    const { t, counter } = countingTracker();
+    const cluster = Array.from({ length: 300 }, (_, i) => `n${i}`);
+    show(t, ...cluster, 'p1', 'p2');
+    cluster.forEach((src, i) => t.recordHash(src, { hash: hashWithBits(i * 3), solid: false }));
+    t.recordHash('p1', { hash: FAR, solid: false });
+    t.recordHash('p2', { hash: FAR, solid: false });
+    assert.equal(t.groups().groups.length, 2);
+
+    let before = counter.calls;
+    show(t, ...cluster, 'p1'); // the pair splits; the cluster is untouched
+    assert.deepEqual(groupsOf(t).map((g) => g.length), [300]);
+    assert.equal(counter.calls - before, 0);
+
+    before = counter.calls;
+    show(t, ...cluster.slice(1), 'p1'); // the cluster loses one and is re-checked
+    assert.equal(t.groups().sizeBySrc.get('n1'), 299);
+    assert.ok(counter.calls - before < 2 * 300, `${counter.calls - before} comparisons`);
+});

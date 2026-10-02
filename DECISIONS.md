@@ -8,17 +8,18 @@ Short records of choices that shape the extension, and why. Newest first.
 
 **Why.** Adding each new hash to the first existing group it matched made the result depend on the order images loaded (A~B and B~C, but A and C too far apart), and a group never shrank when an image was removed or changed its `src`. Recomputing from the live page fixes both, and keeps the cache from evicting URLs that are still shown.
 
-**How it stays fast.** Comparing every hash with every other, or storing every matching pair, is quadratic: a few hundred near-identical images would stall the page. Instead the 992 bits of each hash are dealt into 6 bands (bit *p* goes to band *p* mod 6). Two hashes within 5 bits differ in at most 5 bands, so they share at least one band exactly; an index from band to hashes therefore finds every possible match. Dealing the bits, rather than cutting the hash into consecutive runs, spreads every band over the whole picture, so images that only share a flat background (identical rows of the hash) do not share a band. A union-find over the hashes on the page is extended as hashes arrive and rebuilt only when an image leaves, a pair already in the same group is not compared again, and a comparison is a popcount over 31 machine words.
+**How it stays fast.** Comparing every hash with every other, or storing every matching pair, is quadratic: a few hundred near-identical images would stall the page. Instead the 992 bits of each hash are dealt into 6 bands (bit *p* goes to band *p* mod 6). Two hashes within 5 bits differ in at most 5 bands, so they share at least one band exactly; an index from band to hashes therefore finds every possible match. Dealing the bits, rather than cutting the hash into consecutive runs, spreads every band over the whole picture, so images that only share a flat background (identical rows of the hash) do not share a band. A union-find over the hashes on the page is extended as hashes arrive; when an image leaves, only the group it belonged to is taken apart and re-checked. A pair already in the same group is not compared again, and a comparison is a popcount over 31 machine words.
 
-Measured in Node on a laptop:
+Measured in Node on a laptop (rebuild = after one image leaves):
 
-| Case | Hash comparisons | Time |
+| Case | Hash comparisons | Rebuild |
 | --- | --- | --- |
-| 5,000 unrelated images | 0 | rebuild under 20 ms |
-| 5,000 images sharing a flat top third | 0 | rebuild under 10 ms |
-| one cluster of 990 distinct near-identical images | about 2 per image | about 0.1 s to build, 0.05 s to rebuild |
+| 5,000 unrelated images | 0 | under 50 ms |
+| 5,000 images sharing a flat top third | 0 | under 20 ms |
+| one cluster of 990 distinct near-identical images | about 2 per image | about 0.1 s |
+| 5,000 distinct images agreeing exactly on one band, none matching | one per earlier image sharing the band, on arrival | under 5 ms |
 
-What is left quadratic: many distinct images that agree exactly on one band (a sixth of their bits, spread evenly over the picture) without matching. Each such pair is compared once per build or rebuild: about 0.3 s for 2,000 synthetic images built that way. Unrelated pictures do not agree on an evenly spread sixth of their bits, so this has not been seen outside constructed data.
+The last row is the bound: exact matching cannot skip a pair that shares a band, so a newly hashed image is compared with every image already sharing one of its bands, at most one comparison each (under 1 ms per arrival with 5,000 such images). Nothing is compared twice unless a group loses a member, and then only that group is re-checked.
 
 ## Only the top frame is scanned (0.1.0)
 

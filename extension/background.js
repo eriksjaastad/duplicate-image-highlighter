@@ -63,6 +63,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
 });
 
+/**
+ * Read a response body into a Blob, aborting the download as soon as it
+ * passes IMAGE_FETCH_MAX_BYTES: a missing or wrong Content-Length must not
+ * make the service worker download (and hold) an unbounded body.
+ */
+async function readBody(response, type, controller) {
+    if (!response.body) return new Blob([], { type });
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > IMAGE_FETCH_MAX_BYTES) {
+            controller.abort();
+            throw new Error(`Image too large: over ${IMAGE_FETCH_MAX_BYTES} bytes`);
+        }
+        chunks.push(value);
+    }
+    return new Blob(chunks, { type });
+}
+
 async function fetchImageAsDataUrl(url) {
     const protocol = new URL(url).protocol;
     if (protocol !== 'http:' && protocol !== 'https:') {
@@ -87,11 +110,10 @@ async function fetchImageAsDataUrl(url) {
             throw new Error(`Not an image: ${type}`);
         }
 
-        blob = await response.blob();
+        blob = await readBody(response, type, controller);
     } finally {
         clearTimeout(timer);
     }
-    if (blob.size > IMAGE_FETCH_MAX_BYTES) throw new Error(`Image too large: ${blob.size} bytes`);
 
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
