@@ -43,7 +43,7 @@
 
     /**
      * Enqueues a request to hash an image URL.
-     * Returns a Promise that resolves to the hash string, or null on failure.
+     * Returns a Promise that resolves to { hash, solid }, or null on failure.
      */
     function queueHash(url) {
         return new Promise((resolve) => {
@@ -83,7 +83,7 @@
      * 1. Ask the service worker to fetch the image (cross-origin pixels).
      * 2. Load the data URL into an Image.
      * 3. Draw it onto the 32x32 canvas.
-     * 4. Compute the dHash.
+     * 4. Compute the dHash, and whether the image is one flat color.
      */
     async function computeHashInternal(url) {
         const dataUrl = await fetchImageViaBackground(url);
@@ -95,7 +95,32 @@
         ctx.drawImage(img, 0, 0, TARGET_SIZE, TARGET_SIZE);
 
         const pixels = ctx.getImageData(0, 0, TARGET_SIZE, TARGET_SIZE).data; // RGBA
-        return dHashFromPixels(pixels, TARGET_SIZE);
+        return { hash: dHashFromPixels(pixels, TARGET_SIZE), solid: isSolidFromPixels(pixels) };
+    }
+
+    /**
+     * Brightness standard deviation below which an image counts as one flat
+     * color (a placeholder). Re-encoding noise stays well under it; any visible
+     * pattern or gradient is far above it.
+     */
+    const SOLID_MAX_STDDEV = 2;
+
+    /**
+     * True when every pixel in the RGBA buffer has nearly the same brightness.
+     * The hash alone cannot tell: a smooth left-to-right gradient also hashes
+     * to all zero (or all one) bits.
+     */
+    function isSolidFromPixels(pixels) {
+        let sum = 0;
+        let sumSquares = 0;
+        const count = pixels.length / 4;
+        for (let i = 0; i < pixels.length; i += 4) {
+            const b = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+            sum += b;
+            sumSquares += b * b;
+        }
+        const mean = sum / count;
+        return sumSquares / count - mean * mean < SOLID_MAX_STDDEV * SOLID_MAX_STDDEV;
     }
 
     /**
@@ -181,6 +206,7 @@
         hammingDistance,
         // Exposed for tests
         binToHex,
-        dHashFromPixels
+        dHashFromPixels,
+        isSolidFromPixels
     };
 })();

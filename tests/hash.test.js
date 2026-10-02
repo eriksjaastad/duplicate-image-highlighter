@@ -105,3 +105,18 @@ test('re-injecting the module keeps the first instance', () => {
     vm.runInNewContext(source, { window, document: {}, chrome: {} });
     assert.equal(window.DuplicateImageHash, first);
 });
+
+test('a flat color is solid, with or without re-encoding noise', () => {
+    assert.equal(hasher.isSolidFromPixels(pixels(() => 128)), true);
+    assert.equal(hasher.isSolidFromPixels(pixels((x, y) => 128 + ((x + y) % 3) - 1)), true);
+});
+
+test('a smooth gradient is not solid, though it hashes to all zero bits', () => {
+    const gradient = pixels((x) => x * 8);
+    assert.match(hasher.dHashFromPixels(gradient, SIZE), /^0+$/);
+    assert.equal(hasher.isSolidFromPixels(gradient), false);
+});
+
+test('a pattern is not solid', () => {
+    assert.equal(hasher.isSolidFromPixels(pixels((x, y) => ((x * 7 + y * 13) % 50) + 100)), false);
+});

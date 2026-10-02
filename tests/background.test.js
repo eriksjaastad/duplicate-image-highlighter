@@ -165,13 +165,13 @@ test('badge shows progress, then the group count', () => {
     assert.deepEqual(texts, [[7, '…'], [7, '3'], [7, '0']]);
 });
 
-test('toolbar click injects the hasher and scanner into the top frame only', async () => {
+test('toolbar click injects the hasher, grouper and scanner into the top frame only', async () => {
     const { listeners, injected } = loadBackground(async () => {});
     await listeners.click({ id: 9 });
     assert.equal(injected.length, 1);
     assert.deepEqual(JSON.parse(JSON.stringify(injected[0])), {
         target: { tabId: 9 },
-        files: ['hash.js', 'content.js']
+        files: ['hash.js', 'groups.js', 'content.js']
     });
 });
 

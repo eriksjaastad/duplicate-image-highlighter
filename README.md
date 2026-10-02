@@ -45,9 +45,11 @@ Click the button again to rescan; this also retries images that failed to load. 
 
 ## How it works
 
-Each image is shrunk to 32×32 pixels and turned into a 992-bit *difference hash* (dHash): one bit per pair of neighboring pixels, set when the left one is brighter. Two images whose hashes differ in 5 bits or fewer are treated as the same picture. This survives resizing, re-encoding and small color shifts, and ignores images 100×50 pixels or smaller (icons, spacers) and solid-color placeholders. Cropped versions of an image usually do not match.
+Each image is shrunk to 32×32 pixels and turned into a 992-bit *difference hash* (dHash): one bit per pair of neighboring pixels, set when the left one is brighter. Two images whose hashes differ in 5 bits or fewer are treated as the same picture. Matches chain: if A looks like B and B looks like C, all three are one group. This survives resizing, re-encoding and small color shifts, and ignores images 100×50 pixels or smaller (icons, spacers) and single-color placeholders. Cropped versions of an image usually do not match.
 
 The same image URL used twice on a page is **not** flagged; the extension looks for different files that show the same picture.
+
+Groups follow the page: when an image is removed or its `src` changes, its outline and the toolbar count update, and the images it was grouped with are re-checked without it.
 
 ## Limitations
 
@@ -56,7 +58,7 @@ The same image URL used twice on a page is **not** flagged; the extension looks 
 - Browser-internal pages (`chrome://…`, the Chrome Web Store, built-in PDF viewer) cannot be scanned; the badge shows `×`.
 - Images are fetched without your cookies, so images that need you to be logged in, or that refuse requests from other sites (hotlink protection), are skipped.
 - Images larger than 20 MB, or that take longer than 15 seconds to download, are skipped.
-- A page script that rewrites an image's `style` attribute removes its outline until the next rescan.
+- A page script that rewrites an image's `style` attribute removes its outline until the page next adds or changes an image, or you rescan.
 - The outline sits just inside the image's edge, so when a page crops an image inside a smaller box, or draws captions or arrows over it, part or all of the outline can be hidden. The toolbar count and Alt + Shift + D still list the group.
 - The match threshold (5 bits) is fixed in `extension/content.js` (`HAMMING_THRESHOLD`).
 
@@ -72,7 +74,7 @@ The extension downloads whatever image URLs the page contains, including address
 ## Development
 
 ```bash
-node --test tests/*.test.js     # unit tests (hashing, service worker)
+node --test tests/*.test.js     # unit tests (hashing, grouping, page script, service worker)
 ```
 
 After editing files under `extension/`, click the reload icon on the extension's card in `chrome://extensions`.

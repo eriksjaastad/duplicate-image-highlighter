@@ -1,7 +1,7 @@
 /**
  * Service worker.
  *
- * 1. Toolbar click: injects the hasher into the clicked tab's top frame.
+ * 1. Toolbar click: injects the hasher, grouper and scanner into the clicked tab's top frame.
  *    Nothing runs on a page until you click. Clicking again rescans.
  * 2. Image fetch: content scripts cannot read pixels from cross-origin images
  *    (the canvas is tainted), so they ask the service worker to fetch the
@@ -18,7 +18,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     try {
         await chrome.scripting.executeScript({
             target: { tabId: tab.id },
-            files: ['hash.js', 'content.js']
+            files: ['hash.js', 'groups.js', 'content.js']
         });
     } catch (error) {
         // Browser-internal pages (chrome://, the Web Store, PDFs) refuse injection.
