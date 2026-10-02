@@ -84,17 +84,25 @@
     const OUTLINE_PROPS = ['outline', 'outline-offset'];
 
     // img element -> { count, props: { [prop]: { value, priority, applied } } }
-    // value/priority: the page's inline value to restore; applied: what we set.
+    // value/priority: the page's inline value to restore; applied: what we set
+    // (always with 'important' priority).
     const decorations = new Map();
+
+    // True while a property still holds exactly what we set, value and priority.
+    function stillOurs(img, prop, state) {
+        return img.style.getPropertyValue(prop) === state.applied
+            && img.style.getPropertyPriority(prop) === 'important';
+    }
 
     function clearDecoration(img) {
         const entry = decorations.get(img);
         if (!entry) return;
         decorations.delete(img);
         for (const prop of OUTLINE_PROPS) {
-            const { value, priority, applied } = entry.props[prop];
+            const state = entry.props[prop];
+            const { value, priority } = state;
             // If the page changed this property since we set it, the page's value wins.
-            if (img.style.getPropertyValue(prop) !== applied) continue;
+            if (!stillOurs(img, prop, state)) continue;
             if (value) {
                 img.style.setProperty(prop, value, priority);
             } else {
@@ -116,11 +124,11 @@
         };
         for (const prop of OUTLINE_PROPS) {
             const state = entry.props[prop];
-            const current = img.style.getPropertyValue(prop);
-            if (entry.count === count && current === state.applied) continue;
+            const ours = stillOurs(img, prop, state);
+            if (entry.count === count && ours) continue;
             // First time, or the page set its own value since: that is what to restore.
-            if (current !== state.applied) {
-                state.value = current;
+            if (!ours) {
+                state.value = img.style.getPropertyValue(prop);
                 state.priority = img.style.getPropertyPriority(prop);
             }
             // important: page stylesheets must not hide the highlight
@@ -139,7 +147,7 @@
     });
 
     // img element -> src it was handed to the IntersectionObserver with
-    const watching = new WeakMap();
+    const watching = new Map();
 
     // Images with a pending 'load' listener, so a rescan does not add a second one
     const awaitingLoad = new WeakSet();
@@ -218,6 +226,7 @@
      * Hash an image's URL unless it is already known or being hashed.
      */
     function processImage(img) {
+        if (!img.isConnected) return; // removed while waiting to load
         const src = getImageSrc(img);
         if (!tracker.needsHash(src)) return;
 
@@ -228,7 +237,11 @@
 
         tracker.markPending(src);
         DuplicateImageHash.queueHash(src).then((result) => {
-            tracker.recordHash(src, result);
+            if (result && result.dropped) {
+                tracker.cancelPending(src); // left the page before its turn
+            } else {
+                tracker.recordHash(src, result);
+            }
             scheduleRender();
         });
         reportStatus();
@@ -273,12 +286,19 @@
     });
 
     /**
-     * Record which image URLs are on the page now, and watch images whose URL
-     * still needs hashing.
+     * Record which image URLs are on the page now, watch images whose URL
+     * still needs hashing, and drop work for images that have gone.
      */
     function scanPage() {
         const onPage = [];
-        for (const img of document.querySelectorAll('img')) {
+        const all = document.querySelectorAll('img');
+        const present = new Set(all);
+        for (const img of watching.keys()) {
+            if (present.has(img)) continue;
+            imageObserver.unobserve(img);
+            watching.delete(img);
+        }
+        for (const img of all) {
             const src = getImageSrc(img);
             if (!isHashable(src)) continue;
             onPage.push([img, src]);
@@ -289,6 +309,7 @@
             imageObserver.observe(img);
         }
         tracker.sync(onPage);
+        DuplicateImageHash.dropQueued((src) => !tracker.isLive(src));
         scheduleRender();
     }
 

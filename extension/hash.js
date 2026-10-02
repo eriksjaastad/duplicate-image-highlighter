@@ -43,13 +43,27 @@
 
     /**
      * Enqueues a request to hash an image URL.
-     * Returns a Promise that resolves to { hash, solid }, or null on failure.
+     * Returns a Promise that resolves to { hash, solid }, null on failure, or
+     * { dropped: true } if dropQueued() removed it before it started.
      */
     function queueHash(url) {
         return new Promise((resolve) => {
             queue.push({ url, resolve });
             processQueue();
         });
+    }
+
+    /**
+     * Drop queued (not yet started) hashes whose URL `isUnwanted(url)` says
+     * are no longer needed; their promises resolve to { dropped: true }.
+     * Hashes already in flight finish normally.
+     */
+    function dropQueued(isUnwanted) {
+        for (let i = queue.length - 1; i >= 0; i--) {
+            if (!isUnwanted(queue[i].url)) continue;
+            const [task] = queue.splice(i, 1);
+            task.resolve({ dropped: true });
+        }
     }
 
     /**
@@ -205,6 +219,7 @@
 
     window.DuplicateImageHash = {
         queueHash,
+        dropQueued,
         pendingCount,
         hammingDistance,
         // Exposed for tests

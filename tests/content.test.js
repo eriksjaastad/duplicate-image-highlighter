@@ -32,14 +32,16 @@ class FakeImg {
         this.naturalHeight = height;
         this.style = new FakeStyle();
         this.tagName = 'IMG';
+        this.isConnected = true;
+        this.listeners = [];
     }
     setSrc(src) { this.src = src; this.currentSrc = src; }
-    addEventListener() {}
+    addEventListener(type, fn) { if (type === 'load') this.listeners.push(fn); }
 }
 
 // Loads groups.js and content.js into one fake page, with hashing stubbed.
 function loadPage(images, hashes) {
-    const page = { images: [...images], timers: new Map(), nextTimer: 1, messages: [], observed: new Set(), observeCalls: 0, hashed: [], held: new Map() };
+    const page = { images: [...images], timers: new Map(), nextTimer: 1, messages: [], observed: new Set(), observeCalls: 0, hashed: [], held: new Map(), queued: new Set(), dropped: [], intersecting: true };
 
     const window = {
         addEventListener: () => {}
@@ -80,7 +82,17 @@ function loadPage(images, hashes) {
             page.hashed.push(src);
             const result = () => (src in hashes ? { hash: hashes[src], solid: false } : null);
             if (!page.held.has(src)) return Promise.resolve(result());
-            return new Promise((resolve) => page.held.set(src, () => resolve(result())));
+            return new Promise((resolve) => page.held.set(src, (value) => resolve(value ?? result())));
+        },
+        // Only hashes held as queued (not yet started) can be dropped.
+        dropQueued: (isUnwanted) => {
+            for (const [src, done] of page.held) {
+                if (done && page.queued.has(src) && isUnwanted(src)) {
+                    page.held.delete(src);
+                    page.dropped.push(src);
+                    done({ dropped: true });
+                }
+            }
         }
     };
     vm.runInContext(read('groups.js'), context);
@@ -89,7 +101,7 @@ function loadPage(images, hashes) {
     // Bring every observed image into view, let hashes resolve, run all timers.
     page.settle = async () => {
         for (let round = 0; round < 10; round++) {
-            const visible = [...page.observed];
+            const visible = page.intersecting ? [...page.observed] : [];
             if (visible.length) page.intersect(visible.map((target) => ({ target, isIntersecting: true })));
             await new Promise((r) => setImmediate(r));
             const due = [...page.timers.entries()];
@@ -104,12 +116,25 @@ function loadPage(images, hashes) {
         page.mutate();
         await page.settle();
     };
-    // A hash for this URL stays in flight until release(src).
-    page.hold = (src) => page.held.set(src, null);
+    // A hash for this URL stays in flight (or, with queued, waiting its turn) until release(src).
+    page.hold = (src, { queued = false } = {}) => {
+        page.held.set(src, null);
+        if (queued) page.queued.add(src);
+    };
     page.release = (src) => { const done = page.held.get(src); page.held.delete(src); done(); };
     // The browser finished loading an image (no DOM mutation involved).
     page.loaded = async (img) => {
         page.onLoadCapture({ target: img });
+        await page.settle();
+    };
+    page.remove = (img) => {
+        page.images = page.images.filter((i) => i !== img);
+        img.isConnected = false;
+    };
+    // The browser finished loading this image (its own 'load' listeners).
+    page.imageLoaded = async (img) => {
+        img.complete = true;
+        for (const fn of img.listeners.splice(0)) fn();
         await page.settle();
     };
     page.badge = () => page.messages.filter((m) => m.action === 'SCAN_STATUS').at(-1)?.groups;
@@ -301,4 +326,76 @@ test('a hash that resolves after its image changed src does not outline the new 
     assert.equal(outlined(a1), false);
     assert.equal(outlined(a2), false);
     assert.equal(page.badge(), 0);
+});
+
+test('an outline whose priority the page changed is left to the page', async () => {
+    const a1 = new FakeImg('https://x.example/a1.png');
+    const a2 = new FakeImg('https://x.example/a2.png');
+    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW });
+    await page.settle();
+    const ours = a1.style.getPropertyValue('outline');
+    a1.style.setProperty('outline', ours, ''); // same value, page dropped !important
+    page.remove(a2);
+    await page.changed();
+    assert.equal(a1.style.getPropertyValue('outline'), ours);
+    assert.equal(a1.style.getPropertyPriority('outline'), '');
+    assert.equal(a1.style.getPropertyValue('outline-offset'), '', 'the property still ours is restored');
+});
+
+test('queued hashes for images that left the page are dropped, and redone if they return', async () => {
+    const a1 = new FakeImg('https://x.example/a1.png');
+    const gone = Array.from({ length: 5 }, (_, i) => new FakeImg(`https://x.example/gone${i}.png`));
+    const hashes = { [a1.src]: HASH_LOW };
+    for (const img of gone) hashes[img.src] = HASH_LOW;
+    const page = loadPage([a1, ...gone], hashes);
+    for (const img of gone) page.hold(img.src, { queued: true });
+    await page.settle();
+
+    for (const img of gone) page.remove(img);
+    await page.changed();
+    assert.deepEqual(page.dropped.sort(), gone.map((img) => img.src).sort());
+
+    const back = gone[0];
+    back.isConnected = true;
+    page.images.push(back);
+    await page.changed();
+    assert.equal(page.hashed.filter((src) => src === back.src).length, 2, 'hashed again');
+    assert.equal(outlined(a1), true);
+    assert.equal(outlined(back), true);
+});
+
+test('an image removed before it came into view is no longer watched', async () => {
+    const a1 = new FakeImg('https://x.example/a1.png');
+    const page = loadPage([a1], {});
+    page.intersecting = false;
+    await page.settle();
+    assert.equal(page.observed.has(a1), true);
+    page.remove(a1);
+    await page.changed();
+    assert.equal(page.observed.has(a1), false);
+});
+
+test('an image removed while waiting to load is not hashed when the load arrives', async () => {
+    const lazy = new FakeImg('https://x.example/lazy.png');
+    lazy.complete = false;
+    lazy.naturalWidth = 0;
+    const page = loadPage([lazy], { [lazy.src]: HASH_LOW });
+    await page.settle();
+    page.remove(lazy);
+    await page.changed();
+    lazy.naturalWidth = 400;
+    await page.imageLoaded(lazy);
+    assert.deepEqual(page.hashed, []);
+});
+
+test('a lazy image is hashed once it loads', async () => {
+    const lazy = new FakeImg('https://x.example/lazy.png');
+    lazy.complete = false;
+    lazy.naturalWidth = 0;
+    const page = loadPage([lazy], { [lazy.src]: HASH_LOW });
+    await page.settle();
+    assert.deepEqual(page.hashed, []);
+    lazy.naturalWidth = 400;
+    await page.imageLoaded(lazy);
+    assert.deepEqual(page.hashed, [lazy.src]);
 });

@@ -83,6 +83,20 @@
         }
 
         /**
+         * A pending hash was abandoned before it ran: the URL can be queued again.
+         */
+        function cancelPending(src) {
+            pending.delete(src);
+        }
+
+        /**
+         * True when an element showed this URL at the last sync().
+         */
+        function isLive(src) {
+            return liveSrcs.has(src);
+        }
+
+        /**
          * Record the outcome of hashing a URL: { hash, solid } or null on failure.
          */
         function recordHash(src, result) {
@@ -282,7 +296,7 @@
             return { cached: cache.size, hashes: nodes.size, bands: bandIndex.size, comparisons, pending: pending.size, failed: failed.size };
         }
 
-        return { sync, entries, needsHash, markPending, recordHash, recordSkip, retryFailed, groups, stats };
+        return { sync, entries, isLive, needsHash, markPending, cancelPending, recordHash, recordSkip, retryFailed, groups, stats };
     }
 
     window.DuplicateImageGroups = { createTracker };

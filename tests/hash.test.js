@@ -143,3 +143,23 @@ test('a pattern of equally bright colors is not solid, whichever channels vary',
     assert.equal(hasher.isSolidFromPixels(checkerboard([100, 100, 0], [100, 100, 200])), false); // blue only
     assert.equal(hasher.isSolidFromPixels(checkerboard([200, 100, 0], [200, 100, 0])), true);
 });
+
+test('dropQueued removes waiting hashes, not ones in flight', async () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
+    const window = {};
+    vm.runInNewContext(source, {
+        window,
+        document: { createElement: () => ({ getContext: () => ({}) }) },
+        chrome: { runtime: { sendMessage: () => {} } } // fetches never answer: 5 stay in flight
+    });
+    const h = window.DuplicateImageHash;
+    const results = {};
+    for (let i = 0; i < 8; i++) h.queueHash(`u${i}`).then((r) => { results[`u${i}`] = r; });
+    assert.equal(h.pendingCount(), 8);
+
+    h.dropQueued((url) => url === 'u0' || url === 'u6' || url === 'u7');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(h.pendingCount(), 6);
+    assert.deepEqual(Object.keys(results).sort(), ['u6', 'u7']);
+    assert.equal(results.u6.dropped, true);
+});
