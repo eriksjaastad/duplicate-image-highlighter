@@ -45,7 +45,7 @@ Click the button again to rescan; this also retries images that failed to load. 
 
 ## How it works
 
-Each image is shrunk to 32×32 pixels and turned into a 992-bit *difference hash* (dHash): one bit per pair of neighboring pixels, set when the left one is brighter. Two images whose hashes differ in 5 bits or fewer are treated as the same picture. Matches chain: if A looks like B and B looks like C, all three are one group. This survives resizing, re-encoding and small color shifts, and ignores images 100×50 pixels or smaller (icons, spacers) and single-color placeholders. Cropped versions of an image usually do not match.
+Each image is shrunk to 32×32 pixels (transparent areas count as white) and turned into a 992-bit *difference hash* (dHash): one bit per pair of neighboring pixels, set when the left one is brighter. Two images whose hashes differ in 5 bits or fewer are treated as the same picture. Matches chain: if A looks like B and B looks like C, all three are one group. This survives resizing, re-encoding and small color shifts, and ignores images 100×50 pixels or smaller (icons, spacers) and single-color placeholders. Cropped versions of an image usually do not match.
 
 The same image URL used twice on a page is **not** flagged; the extension looks for different files that show the same picture.
 

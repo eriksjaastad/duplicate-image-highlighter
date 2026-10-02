@@ -163,3 +163,34 @@ test('dropQueued removes waiting hashes, not ones in flight', async () => {
     assert.deepEqual(Object.keys(results).sort(), ['u6', 'u7']);
     assert.equal(results.u6.dropped, true);
 });
+
+test('a pattern made only by transparency is not solid', () => {
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4); // all black
+    for (let i = 0; i < SIZE * SIZE; i++) data[i * 4 + 3] = (i % SIZE) < SIZE / 2 ? 255 : 0;
+    assert.equal(hasher.isSolidFromPixels(data), false);
+});
+
+test('images are drawn over white before their pixels are read', async () => {
+    const calls = [];
+    const ctx = {
+        set fillStyle(v) { calls.push(['fillStyle', v]); },
+        fillRect: (...a) => calls.push(['fillRect', ...a]),
+        clearRect: (...a) => calls.push(['clearRect', ...a]),
+        drawImage: () => calls.push(['drawImage']),
+        getImageData: () => ({ data: pixels((x) => x * 8) })
+    };
+    class Image {
+        set src(v) { this._src = v; setImmediate(() => this.onload()); }
+    }
+    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
+    const window = {};
+    vm.runInNewContext(source, {
+        window,
+        Image,
+        document: { createElement: () => ({ getContext: () => ctx }) },
+        chrome: { runtime: { sendMessage: (msg, cb) => cb({ success: true, dataUrl: 'data:image/png;base64,AA' }) } }
+    });
+    const result = await window.DuplicateImageHash.queueHash('https://x.example/a.png');
+    assert.equal(result.hash.length, 248);
+    assert.deepEqual(calls, [['fillStyle', '#fff'], ['fillRect', 0, 0, SIZE, SIZE], ['drawImage']]);
+});

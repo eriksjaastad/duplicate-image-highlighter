@@ -96,7 +96,7 @@
      * Steps:
      * 1. Ask the service worker to fetch the image (cross-origin pixels).
      * 2. Load the data URL into an Image.
-     * 3. Draw it onto the 32x32 canvas.
+     * 3. Draw it onto the 32x32 canvas, over white.
      * 4. Compute the dHash, and whether the image is one flat color.
      */
     async function computeHashInternal(url) {
@@ -105,7 +105,10 @@
 
         const img = await loadImage(dataUrl);
 
-        ctx.clearRect(0, 0, TARGET_SIZE, TARGET_SIZE);
+        // Composite onto white: transparent pixels would otherwise read as
+        // black (0, 0, 0, 0), hiding a shape drawn on a transparent background.
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, TARGET_SIZE, TARGET_SIZE);
         ctx.drawImage(img, 0, 0, TARGET_SIZE, TARGET_SIZE);
 
         const pixels = ctx.getImageData(0, 0, TARGET_SIZE, TARGET_SIZE).data; // RGBA
@@ -120,14 +123,15 @@
     const SOLID_MAX_STDDEV = 2;
 
     /**
-     * True when every pixel in the RGBA buffer has nearly the same color.
+     * True when every pixel in the RGBA buffer has nearly the same color and
+     * opacity.
      * The hash alone cannot tell: a smooth left-to-right gradient also hashes
      * to all zero (or all one) bits. Each channel is checked on its own, since
      * a pattern of different colors can have one brightness throughout.
      */
     function isSolidFromPixels(pixels) {
         const count = pixels.length / 4;
-        for (let channel = 0; channel < 3; channel++) {
+        for (let channel = 0; channel < 4; channel++) {
             let sum = 0;
             let sumSquares = 0;
             for (let i = channel; i < pixels.length; i += 4) {
