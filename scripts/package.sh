@@ -50,7 +50,10 @@ fi
 
 name="duplicate-image-highlighter-$version"
 mkdir -p "$out"
-git -C "$root" archive --format=zip --prefix="$name/" -o "$out/$name.zip" HEAD:extension
+# A tree (HEAD:extension) carries no time of its own, so stamp every entry
+# with the commit time: the same commit always builds the same bytes.
+commit_time="$(git -C "$root" log -1 --format=%cI HEAD)"
+git -C "$root" archive --format=zip --prefix="$name/" --mtime="$commit_time" -o "$out/$name.zip" HEAD:extension
 printf '%s\n' "$notes" > "$out/release-notes.md"
 
 echo "$out/$name.zip"

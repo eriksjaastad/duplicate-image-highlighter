@@ -114,9 +114,15 @@ test('two builds of the same commit are byte-identical', () => {
     const zip = path.join(first.out, 'duplicate-image-highlighter-0.1.0.zip');
     const bytes = fs.readFileSync(zip);
     fs.utimesSync(path.join(dir, 'extension', 'hash.js'), new Date(), new Date());
+    // Entry times must not come from the clock: wait past the zip format's 2-second resolution.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2100);
     const second = run(dir, '0.1.0');
     assert.equal(second.status, 0, second.stderr);
     assert.equal(Buffer.compare(bytes, fs.readFileSync(zip)), 0);
+    const times = spawnSync('unzip', ['-Z', '-T', zip], { encoding: 'utf8', timeout: 30000 });
+    assert.equal(times.status, 0);
+    const commitTime = git(dir, 'log', '-1', '--format=%cd', '--date=format-local:%Y%m%d.%H%M').trim();
+    assert.ok(times.stdout.includes(commitTime), `entries stamped with the commit time ${commitTime}`);
 });
 
 test('accepts CRLF line endings and trailing whitespace on the heading', () => {
