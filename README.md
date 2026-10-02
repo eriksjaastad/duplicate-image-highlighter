@@ -45,7 +45,7 @@ Click the button again to rescan; this also retries images that failed to load. 
 
 ## How it works
 
-Each image is shrunk to 32×32 pixels and turned into a 992-bit *difference hash* (dHash): one bit per pair of neighboring pixels, set when the left one is brighter. Two images whose hashes differ in 5 bits or fewer are treated as the same picture. This survives resizing, re-encoding and small color shifts, and ignores images under 100×50 pixels (icons, spacers) and solid-color placeholders.
+Each image is shrunk to 32×32 pixels and turned into a 992-bit *difference hash* (dHash): one bit per pair of neighboring pixels, set when the left one is brighter. Two images whose hashes differ in 5 bits or fewer are treated as the same picture. This survives resizing, re-encoding and small color shifts, and ignores images 100×50 pixels or smaller (icons, spacers) and solid-color placeholders. Cropped versions of an image usually do not match.
 
 The same image URL used twice on a page is **not** flagged; the extension looks for different files that show the same picture.
 
@@ -66,6 +66,8 @@ The same image URL used twice on a page is **not** flagged; the extension looks 
 | --- | --- |
 | `scripting` | Inject the scanner into the tab when you click the button. |
 | Host access to `http://*/*` and `https://*/*` | Fetch images from other domains so their pixels can be read. Without it the browser blocks reading cross-origin image pixels. Requests are sent without cookies. |
+
+The extension downloads whatever image URLs the page contains, including addresses on your local network if the page points at them. It sends no cookies and never exposes the downloaded data to the page.
 
 ## Development
 

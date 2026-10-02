@@ -24,7 +24,7 @@
      *
      * With a 32x31 dHash (992 bits / 248 hex chars), typical thresholds:
      * - 0: Exact match only
-     * - 5: Very similar images (compression artifacts, slight crops) [RECOMMENDED]
+     * - 5: Very similar images (resized, re-encoded, compression artifacts) [RECOMMENDED]
      * - 10: Moderately similar (same scene, different quality)
      * - 15+: Loose matching (may catch unrelated images)
      */
