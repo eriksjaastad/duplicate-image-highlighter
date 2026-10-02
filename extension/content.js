@@ -203,12 +203,15 @@
     let statusTimer = null;
 
     /**
-     * Tell the service worker how the scan is going, debounced so a burst of
-     * hashes produces one update and the final one sees an empty queue.
+     * Tell the service worker how the scan is going, at most every 250ms.
+     * Throttled, not debounced: the badge keeps updating while hashes keep
+     * arriving, and each update reads the state when it is sent, so the last
+     * one sees the empty queue.
      */
     function reportStatus() {
-        clearTimeout(statusTimer);
+        if (statusTimer !== null) return;
         statusTimer = setTimeout(() => {
+            statusTimer = null;
             chrome.runtime.sendMessage({
                 action: 'SCAN_STATUS',
                 pending: DuplicateImageHash.pendingCount(),

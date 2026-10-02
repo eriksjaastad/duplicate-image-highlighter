@@ -41,7 +41,7 @@ class FakeImg {
 
 // Loads groups.js and content.js into one fake page, with hashing stubbed.
 function loadPage(images, hashes) {
-    const page = { images: [...images], timers: new Map(), nextTimer: 1, messages: [], observed: new Set(), observeCalls: 0, hashed: [], held: new Map(), queued: new Set(), dropped: [], intersecting: true };
+    const page = { images: [...images], timers: new Map(), nextTimer: 1, messages: [], observed: new Set(), observeCalls: 0, hashed: [], held: new Map(), queued: new Set(), dropped: [], intersecting: true, cleared: 0 };
 
     const window = {
         addEventListener: () => {}
@@ -63,7 +63,7 @@ function loadPage(images, hashes) {
             }
         },
         setTimeout: (fn) => { const id = page.nextTimer++; page.timers.set(id, fn); return id; },
-        clearTimeout: (id) => { page.timers.delete(id); },
+        clearTimeout: (id) => { page.cleared++; page.timers.delete(id); },
         IntersectionObserver: class {
             constructor(callback) { page.intersect = callback; this.callback = callback; }
             observe(el) { page.observeCalls++; page.observed.add(el); }
@@ -398,4 +398,14 @@ test('a lazy image is hashed once it loads', async () => {
     lazy.naturalWidth = 400;
     await page.imageLoaded(lazy);
     assert.deepEqual(page.hashed, [lazy.src]);
+});
+
+test('the badge keeps updating while hashes keep arriving', async () => {
+    const images = Array.from({ length: 12 }, (_, i) => new FakeImg(`https://x.example/i${i}.png`));
+    const hashes = {};
+    for (const img of images) hashes[img.src] = HASH_LOW;
+    const page = loadPage(images, hashes);
+    await page.settle();
+    assert.equal(page.cleared, 0, 'a pending badge update is never pushed back');
+    assert.equal(page.badge(), 1);
 });
