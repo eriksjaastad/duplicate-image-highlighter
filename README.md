@@ -58,6 +58,7 @@ Groups follow the page: when an image is removed or its `src` changes, its outli
 - Browser-internal pages (`chrome://…`, the Chrome Web Store, built-in PDF viewer) cannot be scanned; the badge shows `×`.
 - Images are fetched without your cookies, so images that need you to be logged in, or that refuse requests from other sites (hotlink protection), are skipped.
 - Images larger than 20 MB, or that take longer than 15 seconds to download, are skipped.
+- On pages whose Content-Security-Policy does not allow `data:` images, SVG images may not be compared (other formats are decoded without that restriction).
 - A page script that rewrites an image's `style` attribute removes its outline until the page next adds or changes an image, or you rescan.
 - The outline sits just inside the image's edge, so when a page crops an image inside a smaller box, or draws captions or arrows over it, part or all of the outline can be hidden. The toolbar count and Alt + Shift + D still list the group.
 - The match threshold (5 bits) is fixed in `extension/content.js` (`HAMMING_THRESHOLD`).

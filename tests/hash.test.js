@@ -170,27 +170,65 @@ test('a pattern made only by transparency is not solid', () => {
     assert.equal(hasher.isSolidFromPixels(data), false);
 });
 
-test('images are drawn over white before their pixels are read', async () => {
+// hash.js with a recording fake canvas; `extra` adds globals (createImageBitmap, Image, ...).
+function loadWithCanvas(extra) {
     const calls = [];
     const ctx = {
         set fillStyle(v) { calls.push(['fillStyle', v]); },
         fillRect: (...a) => calls.push(['fillRect', ...a]),
         clearRect: (...a) => calls.push(['clearRect', ...a]),
-        drawImage: () => calls.push(['drawImage']),
+        drawImage: (img) => calls.push(['drawImage', img.kind]),
         getImageData: () => ({ data: pixels((x) => x * 8) })
     };
-    class Image {
-        set src(v) { this._src = v; setImmediate(() => this.onload()); }
-    }
     const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
     const window = {};
     vm.runInNewContext(source, {
-        window,
-        Image,
+        window, atob, Blob, Uint8Array,
         document: { createElement: () => ({ getContext: () => ctx }) },
-        chrome: { runtime: { sendMessage: (msg, cb) => cb({ success: true, dataUrl: 'data:image/png;base64,AA' }) } }
+        chrome: { runtime: { sendMessage: (msg, cb) => cb({ success: true, dataUrl: 'data:image/png;base64,AQID' }) } },
+        ...extra
     });
-    const result = await window.DuplicateImageHash.queueHash('https://x.example/a.png');
+    return { hasher: window.DuplicateImageHash, calls };
+}
+
+class FakeImage {
+    constructor() { this.kind = 'Image'; FakeImage.made++; }
+    set src(v) { this.loaded = v; setImmediate(() => this.onload()); }
+}
+FakeImage.made = 0;
+
+test('images are drawn over white before their pixels are read', async () => {
+    let closed = false;
+    const { hasher, calls } = loadWithCanvas({
+        createImageBitmap: async () => ({ kind: 'bitmap', close: () => { closed = true; } })
+    });
+    const result = await hasher.queueHash('https://x.example/a.png');
     assert.equal(result.hash.length, 248);
-    assert.deepEqual(calls, [['fillStyle', '#fff'], ['fillRect', 0, 0, SIZE, SIZE], ['drawImage']]);
+    assert.deepEqual(calls, [['fillStyle', '#fff'], ['fillRect', 0, 0, SIZE, SIZE], ['drawImage', 'bitmap']]);
+    assert.equal(closed, true, 'bitmap released');
+});
+
+test('raster images decode from a Blob, never through a data URL in the page', async () => {
+    const blobs = [];
+    FakeImage.made = 0;
+    const { hasher } = loadWithCanvas({
+        Image: FakeImage,
+        createImageBitmap: async (blob) => { blobs.push(blob); return { kind: 'bitmap', close() {} }; }
+    });
+    await hasher.queueHash('https://x.example/a.png');
+    assert.equal(FakeImage.made, 0);
+    assert.equal(blobs[0].type, 'image/png');
+    assert.deepEqual([...new Uint8Array(await blobs[0].arrayBuffer())], [1, 2, 3]);
+});
+
+test('formats createImageBitmap cannot decode fall back to the data URL', async () => {
+    FakeImage.made = 0;
+    const { hasher, calls } = loadWithCanvas({
+        Image: FakeImage,
+        createImageBitmap: async () => { throw new Error('The source image could not be decoded.'); }
+    });
+    const result = await hasher.queueHash('https://x.example/a.svg');
+    assert.equal(result.hash.length, 248);
+    assert.equal(FakeImage.made, 1);
+    assert.deepEqual(calls.at(-1), ['drawImage', 'Image']);
 });

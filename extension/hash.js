@@ -103,13 +103,14 @@
         const dataUrl = await fetchImageViaBackground(url);
         if (!dataUrl) return null;
 
-        const img = await loadImage(dataUrl);
+        const img = await decodeImage(dataUrl);
 
         // Composite onto white: transparent pixels would otherwise read as
         // black (0, 0, 0, 0), hiding a shape drawn on a transparent background.
         ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, TARGET_SIZE, TARGET_SIZE);
         ctx.drawImage(img, 0, 0, TARGET_SIZE, TARGET_SIZE);
+        if (img.close) img.close(); // ImageBitmap: free the decoded pixels now
 
         const pixels = ctx.getImageData(0, 0, TARGET_SIZE, TARGET_SIZE).data; // RGBA
         return { hash: dHashFromPixels(pixels, TARGET_SIZE), solid: isSolidFromPixels(pixels) };
@@ -176,6 +177,34 @@
                 }
             });
         });
+    }
+
+    /**
+     * Decode image bytes without loading a URL into the page: a page whose
+     * Content-Security-Policy leaves `data:` out of img-src blocks
+     * `new Image()` with a data URL, but not createImageBitmap on a Blob.
+     * Formats createImageBitmap cannot decode (SVG) fall back to the data URL.
+     */
+    async function decodeImage(dataUrl) {
+        let bitmap;
+        try {
+            bitmap = await createImageBitmap(dataUrlToBlob(dataUrl));
+        } catch (err) {
+            // Not decodable as a bitmap (SVG): the data URL path below decides.
+            return loadImage(dataUrl);
+        }
+        return bitmap;
+    }
+
+    // Base64 data URL -> Blob, without fetch(), which a page's connect-src could block.
+    function dataUrlToBlob(dataUrl) {
+        const comma = dataUrl.indexOf(',');
+        const header = dataUrl.slice(5, comma); // after 'data:'
+        const type = header.split(';')[0];
+        const binary = atob(dataUrl.slice(comma + 1));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new Blob([bytes], { type });
     }
 
     function loadImage(src) {
