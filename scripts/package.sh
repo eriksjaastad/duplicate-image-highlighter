@@ -51,9 +51,10 @@ fi
 name="duplicate-image-highlighter-$version"
 mkdir -p "$out"
 # A tree (HEAD:extension) carries no time of its own, so stamp every entry
-# with the commit time: the same commit always builds the same bytes.
+# with the commit time; zip entry times are local, so build in UTC. The same
+# commit then builds the same bytes on any machine.
 commit_time="$(git -C "$root" log -1 --format=%cI HEAD)"
-git -C "$root" archive --format=zip --prefix="$name/" --mtime="$commit_time" -o "$out/$name.zip" HEAD:extension
+TZ=UTC git -C "$root" archive --format=zip --prefix="$name/" --mtime="$commit_time" -o "$out/$name.zip" HEAD:extension
 printf '%s\n' "$notes" > "$out/release-notes.md"
 
 echo "$out/$name.zip"

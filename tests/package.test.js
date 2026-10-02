@@ -56,9 +56,15 @@ function zipEntries(zip) {
 }
 
 function run(dir, ...args) {
+    return runIn(dir, process.env.TZ, ...args);
+}
+
+function runIn(dir, tz, ...args) {
     const out = path.join(dir, 'out');
+    const env = { ...process.env, OUT_DIR: out };
+    if (tz) env.TZ = tz; else delete env.TZ;
     const result = spawnSync('bash', [path.join(dir, 'scripts', 'package.sh'), ...args], {
-        env: { ...process.env, OUT_DIR: out },
+        env,
         encoding: 'utf8',
         timeout: 30000
     });
@@ -123,6 +129,17 @@ test('two builds of the same commit are byte-identical', () => {
     assert.equal(times.status, 0);
     const commitTime = git(dir, 'log', '-1', '--format=%cd', '--date=format-local:%Y%m%d.%H%M').trim();
     assert.ok(times.stdout.includes(commitTime), `entries stamped with the commit time ${commitTime}`);
+});
+
+test('builds the same bytes in any timezone', () => {
+    const dir = fixture();
+    const zip = (out) => fs.readFileSync(path.join(out, 'duplicate-image-highlighter-0.1.0.zip'));
+    const east = runIn(dir, 'Asia/Kolkata', '0.1.0');
+    assert.equal(east.status, 0, east.stderr);
+    const bytes = zip(east.out);
+    const west = runIn(dir, 'America/Los_Angeles', '0.1.0');
+    assert.equal(west.status, 0, west.stderr);
+    assert.equal(Buffer.compare(bytes, zip(west.out)), 0);
 });
 
 test('accepts CRLF line endings and trailing whitespace on the heading', () => {
