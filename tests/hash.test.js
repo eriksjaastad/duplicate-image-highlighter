@@ -171,13 +171,17 @@ test('a pattern made only by transparency is not solid', () => {
 });
 
 // hash.js with a recording fake canvas; `extra` adds globals (createImageBitmap, Image, ...).
-function loadWithCanvas(extra) {
+// Options: `dataUrl` replaces what the service worker returns; `drawThrows` makes drawImage throw.
+function loadWithCanvas({ dataUrl = 'data:image/png;base64,AQID', drawThrows = null, ...extra } = {}) {
     const calls = [];
     const ctx = {
         set fillStyle(v) { calls.push(['fillStyle', v]); },
         fillRect: (...a) => calls.push(['fillRect', ...a]),
         clearRect: (...a) => calls.push(['clearRect', ...a]),
-        drawImage: (img) => calls.push(['drawImage', img.kind]),
+        drawImage: (img) => {
+            if (drawThrows) throw drawThrows;
+            calls.push(['drawImage', img.kind]);
+        },
         getImageData: () => ({ data: pixels((x) => x * 8) })
     };
     const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
@@ -185,7 +189,7 @@ function loadWithCanvas(extra) {
     vm.runInNewContext(source, {
         window, atob, Blob, Uint8Array,
         document: { createElement: () => ({ getContext: () => ctx }) },
-        chrome: { runtime: { sendMessage: (msg, cb) => cb({ success: true, dataUrl: 'data:image/png;base64,AQID' }) } },
+        chrome: { runtime: { sendMessage: (msg, cb) => cb({ success: true, dataUrl }) } },
         ...extra
     });
     return { hasher: window.DuplicateImageHash, calls };
@@ -229,6 +233,50 @@ test('formats createImageBitmap cannot decode fall back to the data URL', async 
     });
     const result = await hasher.queueHash('https://x.example/a.svg');
     assert.equal(result.hash.length, 248);
+    assert.equal(FakeImage.made, 1);
+    assert.deepEqual(calls.at(-1), ['drawImage', 'Image']);
+});
+
+test('when both decoders fail, the hash is null and the warning names both causes', async () => {
+    const warnings = [];
+    class FailingImage {
+        set src(v) { setImmediate(() => this.onerror({ type: 'error' })); }
+    }
+    const { hasher, calls } = loadWithCanvas({
+        Image: FailingImage,
+        console: { warn: (...a) => warnings.push(a.map(String).join(' ')) },
+        createImageBitmap: async () => { throw new Error('The source image could not be decoded.'); }
+    });
+    assert.equal(await hasher.queueHash('https://x.example/a.svg'), null);
+    assert.equal(calls.length, 0, 'nothing drawn');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /as a bitmap: The source image could not be decoded\.; as an Image: error event/);
+});
+
+test('a bitmap is released even when drawing it throws', async () => {
+    let closed = false;
+    const warnings = [];
+    const { hasher } = loadWithCanvas({
+        drawThrows: new Error('The image source is detached'),
+        console: { warn: (...a) => warnings.push(a) },
+        createImageBitmap: async () => ({ kind: 'bitmap', close: () => { closed = true; } })
+    });
+    assert.equal(await hasher.queueHash('https://x.example/a.png'), null);
+    assert.equal(closed, true, 'bitmap released');
+    assert.equal(warnings.length, 1);
+});
+
+test('a data URL that is not valid base64 falls back to the Image decoder', async () => {
+    FakeImage.made = 0;
+    let bitmapCalls = 0;
+    const { hasher, calls } = loadWithCanvas({
+        Image: FakeImage,
+        createImageBitmap: async () => { bitmapCalls++; return { kind: 'bitmap', close() {} }; },
+        dataUrl: 'data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg"/>'
+    });
+    const result = await hasher.queueHash('https://x.example/a.svg');
+    assert.equal(result.hash.length, 248);
+    assert.equal(bitmapCalls, 0, 'atob rejected the payload before createImageBitmap ran');
     assert.equal(FakeImage.made, 1);
     assert.deepEqual(calls.at(-1), ['drawImage', 'Image']);
 });

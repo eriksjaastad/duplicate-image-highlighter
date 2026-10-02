@@ -95,7 +95,7 @@
     /**
      * Steps:
      * 1. Ask the service worker to fetch the image (cross-origin pixels).
-     * 2. Load the data URL into an Image.
+     * 2. Decode the bytes (createImageBitmap on a Blob; SVG via the data URL).
      * 3. Draw it onto the 32x32 canvas, over white.
      * 4. Compute the dHash, and whether the image is one flat color.
      */
@@ -107,10 +107,13 @@
 
         // Composite onto white: transparent pixels would otherwise read as
         // black (0, 0, 0, 0), hiding a shape drawn on a transparent background.
-        ctx.fillStyle = '#fff';
-        ctx.fillRect(0, 0, TARGET_SIZE, TARGET_SIZE);
-        ctx.drawImage(img, 0, 0, TARGET_SIZE, TARGET_SIZE);
-        if (img.close) img.close(); // ImageBitmap: free the decoded pixels now
+        try {
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, TARGET_SIZE, TARGET_SIZE);
+            ctx.drawImage(img, 0, 0, TARGET_SIZE, TARGET_SIZE);
+        } finally {
+            if (img.close) img.close(); // ImageBitmap: free the decoded pixels now
+        }
 
         const pixels = ctx.getImageData(0, 0, TARGET_SIZE, TARGET_SIZE).data; // RGBA
         return { hash: dHashFromPixels(pixels, TARGET_SIZE), solid: isSolidFromPixels(pixels) };
@@ -125,7 +128,9 @@
 
     /**
      * True when every pixel in the RGBA buffer has nearly the same color and
-     * opacity.
+     * opacity. Hashed images are drawn over white, so their alpha is always
+     * flat by the time they get here; checking it keeps this function correct
+     * for any RGBA buffer, not only composited ones.
      * The hash alone cannot tell: a smooth left-to-right gradient also hashes
      * to all zero (or all one) bits. Each channel is checked on its own, since
      * a pattern of different colors can have one brightness throughout.
@@ -186,14 +191,24 @@
      * Formats createImageBitmap cannot decode (SVG) fall back to the data URL.
      */
     async function decodeImage(dataUrl) {
-        let bitmap;
         try {
-            bitmap = await createImageBitmap(dataUrlToBlob(dataUrl));
-        } catch (err) {
-            // Not decodable as a bitmap (SVG): the data URL path below decides.
-            return loadImage(dataUrl);
+            return await createImageBitmap(dataUrlToBlob(dataUrl));
+        } catch (bitmapErr) {
+            // Not decodable as a bitmap (SVG): try the data URL. If that fails
+            // too, report both causes; an Image error event carries no message.
+            try {
+                return await loadImage(dataUrl);
+            } catch (imageErr) {
+                throw new Error(`could not decode image (as a bitmap: ${describeError(bitmapErr)}; ` +
+                    `as an Image: ${describeError(imageErr)})`);
+            }
         }
-        return bitmap;
+    }
+
+    function describeError(err) {
+        if (err && err.message) return err.message;
+        if (err && err.type) return `${err.type} event`;
+        return String(err);
     }
 
     // Base64 data URL -> Blob, without fetch(), which a page's connect-src could block.
