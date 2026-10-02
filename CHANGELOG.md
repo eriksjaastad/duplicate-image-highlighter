@@ -13,3 +13,4 @@ First public release.
 - Duplicates are marked with an outline drawn inside the image's edge, colored by how many look-alike files there are. Outlines take no space, so the page layout never moves; the image's own inline outline styles (width, style, color, offset) are each restored when a highlight is cleared, unless the page has changed that property since.
 - Clicking again rescans and retries images that failed to load.
 - Image fetches go through the service worker without cookies, accept only `http(s)` URLs and image (or unlabeled) content types, time out after 15 seconds, and skip images over 20 MB.
+- Each GitHub Release carries a zip of the extension, ready for **Load unpacked**.
