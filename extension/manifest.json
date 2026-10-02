@@ -1,0 +1,19 @@
+{
+    "manifest_version": 3,
+    "name": "Duplicate Image Highlighter",
+    "version": "0.1.0",
+    "description": "Click the toolbar button to highlight duplicate and near-duplicate images on the current page.",
+    "permissions": [
+        "scripting"
+    ],
+    "host_permissions": [
+        "http://*/*",
+        "https://*/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "action": {
+        "default_title": "Highlight duplicate images on this page"
+    }
+}
