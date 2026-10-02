@@ -11,6 +11,12 @@
  * - Groups: connected components of the URLs on the page, where two URLs are
  *   connected when their hashes differ by at most `threshold` bits. A~B and
  *   B~C put A, B and C in one group whatever order they were hashed in.
+ *
+ * No pairwise links are stored. Each hash is split into threshold + 1 bands:
+ * two hashes within `threshold` bits must agree exactly on at least one band
+ * (pigeonhole), so a band index finds every possible match without comparing
+ * unrelated images. The union-find over images on the page is kept between
+ * calls, extended as hashes arrive, and rebuilt only when an image leaves.
  */
 (function () {
     // Clicking the toolbar button again re-injects this file; keep the first instance.
@@ -31,8 +37,16 @@
 
         // URL -> { node } for a hashed image, or { skip: true } for one never compared
         const cache = new Map();
-        // hash -> { srcs: Set of cached URLs with this exact hash, neighbors: Set of nodes within threshold }
+        // hash -> { hash, srcs: Set of cached URLs with this exact hash, bands: band keys }
         const nodes = new Map();
+        // band key -> Set of nodes with that band
+        const bandIndex = new Map();
+        const bandCount = threshold + 1;
+        // Union-find over hash nodes on the page. Each member node carries
+        // `up` (its parent) and `round` (=== round while it is a member);
+        // bumping `round` empties the union in O(1).
+        let round = 0;
+        let members = new Set();
         // URLs being hashed now
         const pending = new Set();
         // URLs that failed to hash, oldest first (a rescan retries them)
@@ -96,17 +110,22 @@
         function nodeFor(hash, src) {
             let node = nodes.get(hash);
             if (!node) {
-                node = { hash, srcs: new Set(), neighbors: new Set() };
-                for (const other of nodes.values()) {
-                    if (distance(hash, other.hash, threshold) <= threshold) {
-                        node.neighbors.add(other);
-                        other.neighbors.add(node);
-                    }
+                node = { hash, srcs: new Set(), bands: bandsOf(hash), round: -1, up: null };
+                for (const band of node.bands) {
+                    if (!bandIndex.has(band)) bandIndex.set(band, new Set());
+                    bandIndex.get(band).add(node);
                 }
                 nodes.set(hash, node);
             }
             node.srcs.add(src);
             return node;
+        }
+
+        function bandsOf(hash) {
+            const size = Math.ceil(hash.length / bandCount);
+            const bands = [];
+            for (let i = 0; i < bandCount; i++) bands.push(`${i}:${hash.slice(i * size, (i + 1) * size)}`);
+            return bands;
         }
 
         // Drop a URL from the cache, and its hash node once no URL uses it.
@@ -118,8 +137,14 @@
             const node = entry.node;
             node.srcs.delete(src);
             if (node.srcs.size > 0) return;
-            for (const other of node.neighbors) other.neighbors.delete(node);
+            for (const band of node.bands) {
+                const inBand = bandIndex.get(band);
+                inBand.delete(node);
+                if (inBand.size === 0) bandIndex.delete(band);
+            }
             nodes.delete(node.hash);
+            // Left in `members` on purpose: groups() sees a node that is not on
+            // the page and rebuilds, so nothing still points at a dropped node.
         }
 
         // Evict the oldest URLs no longer on the page until the cache fits.
@@ -156,24 +181,17 @@
                 liveByNode.get(node).add(src);
             }
 
-            // Union-find over hash nodes on the page; a match through an image
-            // that has left the page does not count.
-            const parent = new Map();
-            for (const node of liveByNode.keys()) parent.set(node, node);
-            function find(node) {
-                while (parent.get(node) !== node) {
-                    parent.set(node, parent.get(parent.get(node)));
-                    node = parent.get(node);
+            // A match through an image that has left the page does not count:
+            // when one leaves, start over. Otherwise only add the new ones.
+            for (const node of members) {
+                if (!liveByNode.has(node)) {
+                    round++;
+                    members = new Set();
+                    break;
                 }
-                return node;
             }
             for (const node of liveByNode.keys()) {
-                for (const other of node.neighbors) {
-                    if (!parent.has(other)) continue;
-                    const a = find(node);
-                    const b = find(other);
-                    if (a !== b) parent.set(a, b);
-                }
+                if (node.round !== round) addToUnion(node);
             }
 
             const byRoot = new Map();
@@ -192,10 +210,33 @@
             return result;
         }
 
+        function find(node) {
+            while (node.up !== node) {
+                node.up = node.up.up;
+                node = node.up;
+            }
+            return node;
+        }
+
+        // Join a node to every node on the page that shares a band with it and
+        // is within the threshold, skipping ones already in its group.
+        function addToUnion(node) {
+            node.round = round;
+            node.up = node;
+            members.add(node);
+            for (const band of node.bands) {
+                for (const other of bandIndex.get(band)) {
+                    if (other === node || other.round !== round) continue;
+                    const a = find(node);
+                    const b = find(other);
+                    if (a === b) continue;
+                    if (distance(node.hash, other.hash, threshold) <= threshold) a.up = b;
+                }
+            }
+        }
+
         function stats() {
-            let links = 0;
-            for (const node of nodes.values()) links += node.neighbors.size;
-            return { cached: cache.size, hashes: nodes.size, links: links / 2, pending: pending.size, failed: failed.size };
+            return { cached: cache.size, hashes: nodes.size, bands: bandIndex.size, pending: pending.size, failed: failed.size };
         }
 
         return { sync, entries, needsHash, markPending, recordHash, recordSkip, retryFailed, groups, stats };

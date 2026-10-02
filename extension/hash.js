@@ -99,28 +99,31 @@
     }
 
     /**
-     * Brightness standard deviation below which an image counts as one flat
+     * Per-channel standard deviation below which an image counts as one flat
      * color (a placeholder). Re-encoding noise stays well under it; any visible
      * pattern or gradient is far above it.
      */
     const SOLID_MAX_STDDEV = 2;
 
     /**
-     * True when every pixel in the RGBA buffer has nearly the same brightness.
+     * True when every pixel in the RGBA buffer has nearly the same color.
      * The hash alone cannot tell: a smooth left-to-right gradient also hashes
-     * to all zero (or all one) bits.
+     * to all zero (or all one) bits. Each channel is checked on its own, since
+     * a pattern of different colors can have one brightness throughout.
      */
     function isSolidFromPixels(pixels) {
-        let sum = 0;
-        let sumSquares = 0;
         const count = pixels.length / 4;
-        for (let i = 0; i < pixels.length; i += 4) {
-            const b = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
-            sum += b;
-            sumSquares += b * b;
+        for (let channel = 0; channel < 3; channel++) {
+            let sum = 0;
+            let sumSquares = 0;
+            for (let i = channel; i < pixels.length; i += 4) {
+                sum += pixels[i];
+                sumSquares += pixels[i] * pixels[i];
+            }
+            const mean = sum / count;
+            if (sumSquares / count - mean * mean >= SOLID_MAX_STDDEV * SOLID_MAX_STDDEV) return false;
         }
-        const mean = sum / count;
-        return sumSquares / count - mean * mean < SOLID_MAX_STDDEV * SOLID_MAX_STDDEV;
+        return true;
     }
 
     /**

@@ -159,23 +159,39 @@ test('eviction drops a hash node once no URL uses it', () => {
     t.recordHash('x', { hash: A, solid: false });
     t.recordHash('y', { hash: FAR, solid: false });
     show(t);
-    assert.deepEqual({ ...t.stats() }, { cached: 1, hashes: 1, links: 0, pending: 0, failed: 0 });
+    assert.deepEqual({ ...t.stats() }, { cached: 1, hashes: 1, bands: 6, pending: 0, failed: 0 });
     // The evicted node must no longer link anything: a later B matches nothing on the page.
     show(t, 'b', 'y');
     t.recordHash('b', { hash: B, solid: false });
     assert.deepEqual(groupsOf(t), []);
 });
 
-test('evicting a hash unlinks it from its look-alikes', () => {
-    const t = tracker({ maxCacheEntries: 2 });
-    show(t, 'a', 'b');
-    t.recordHash('old', { hash: C, solid: false });
+test('evicting a hash removes it from the band index', () => {
+    const t = tracker({ maxCacheEntries: 1 });
+    show(t, 'a');
+    // one differing bit in each of the six bands: shares no band with A
+    t.recordHash('far', { hash: hashWithBits(0, 170, 340, 510, 680, 850), solid: false });
     t.recordHash('a', { hash: A, solid: false });
-    assert.equal(t.stats().links, 0);
-    t.recordHash('b', { hash: B, solid: false }); // links to A and C
-    assert.equal(t.stats().links, 2);
-    show(t, 'a', 'b'); // C is evicted
-    assert.deepEqual({ ...t.stats() }, { cached: 2, hashes: 2, links: 1, pending: 0, failed: 0 });
+    assert.equal(t.stats().bands, 12);
+    show(t, 'a'); // 'far' is evicted
+    assert.deepEqual({ ...t.stats() }, { cached: 1, hashes: 1, bands: 6, pending: 0, failed: 0 });
+});
+
+test('groups are rebuilt correctly after the image joining them is evicted, and rejoin when it returns', () => {
+    const t = tracker({ maxCacheEntries: 2 });
+    show(t, 'a', 'b', 'c');
+    t.recordHash('a', { hash: A, solid: false });
+    t.recordHash('b', { hash: B, solid: false });
+    t.recordHash('c', { hash: C, solid: false });
+    assert.deepEqual(groupsOf(t), [['a', 'b', 'c']]);
+
+    show(t, 'a', 'c'); // b leaves the page and is evicted
+    assert.equal(t.needsHash('b'), true);
+    assert.deepEqual(groupsOf(t), []);
+
+    show(t, 'a', 'c', 'b2');
+    t.recordHash('b2', { hash: B, solid: false });
+    assert.deepEqual(groupsOf(t), [['a', 'b2', 'c']]);
 });
 
 test('a URL hashed since the last sync survives the next eviction if it is on the page', () => {
@@ -249,4 +265,52 @@ test('re-injecting the module keeps the first instance', () => {
     const win = { DuplicateImageGroups: first };
     load('groups.js', win);
     assert.equal(win.DuplicateImageGroups, first);
+});
+
+// Counts calls to the distance function.
+function countingTracker(options = {}) {
+    const counter = { calls: 0 };
+    const t = tracker({
+        maxCacheEntries: 10000,
+        distance: (a, b, limit) => { counter.calls++; return hammingDistance(a, b, limit); },
+        ...options
+    });
+    return { t, counter };
+}
+
+test('a large cluster of near-identical images costs about one comparison per image', () => {
+    const { t, counter } = countingTracker();
+    const srcs = Array.from({ length: 300 }, (_, i) => `n${i}`);
+    show(t, ...srcs);
+    // Each differs from A in one bit of its own: every pair is 2 bits apart.
+    srcs.forEach((src, i) => {
+        t.recordHash(src, { hash: hashWithBits(i * 3), solid: false });
+        if (i % 20 === 0) t.groups(); // renders while hashes arrive
+    });
+    assert.equal(t.groups().groups.length, 1);
+    assert.equal(t.groups().sizeBySrc.get('n0'), 300);
+    assert.ok(counter.calls < 2 * srcs.length, `${counter.calls} comparisons`);
+});
+
+test('unrelated images are not compared at all', () => {
+    const { t, counter } = countingTracker();
+    let seed = 1;
+    const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const srcs = Array.from({ length: 2000 }, (_, i) => `u${i}`);
+    show(t, ...srcs);
+    for (const src of srcs) {
+        const hash = Array.from({ length: HASH_LENGTH }, () => Math.floor(random() * 16).toString(16)).join('');
+        t.recordHash(src, { hash, solid: false });
+    }
+    assert.equal(t.groups().groups.length, 0);
+    assert.ok(counter.calls < 50, `${counter.calls} comparisons`);
+});
+
+test('bands catch a match whose differing bits are spread across the hash', () => {
+    const t = tracker();
+    show(t, 'x', 'y');
+    // 5 bits apart, one in each of five different bands
+    t.recordHash('x', { hash: A, solid: false });
+    t.recordHash('y', { hash: hashWithBits(0, 170, 340, 510, 680), solid: false });
+    assert.deepEqual(groupsOf(t), [['x', 'y']]);
 });

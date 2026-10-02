@@ -120,3 +120,26 @@ test('a smooth gradient is not solid, though it hashes to all zero bits', () => 
 test('a pattern is not solid', () => {
     assert.equal(hasher.isSolidFromPixels(pixels((x, y) => ((x * 7 + y * 13) % 50) + 100)), false);
 });
+
+// Checkerboard of two colors given as [r, g, b].
+function checkerboard(first, second) {
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    for (let y = 0; y < SIZE; y++) {
+        for (let x = 0; x < SIZE; x++) {
+            const i = (y * SIZE + x) * 4;
+            const [r, g, b] = (x + y) % 2 === 0 ? first : second;
+            data[i] = r;
+            data[i + 1] = g;
+            data[i + 2] = b;
+            data[i + 3] = 255;
+        }
+    }
+    return data;
+}
+
+test('a pattern of equally bright colors is not solid, whichever channels vary', () => {
+    assert.equal(hasher.isSolidFromPixels(checkerboard([200, 0, 0], [0, 200, 0])), false);
+    assert.equal(hasher.isSolidFromPixels(checkerboard([100, 200, 0], [100, 0, 200])), false);
+    assert.equal(hasher.isSolidFromPixels(checkerboard([100, 100, 0], [100, 100, 200])), false); // blue only
+    assert.equal(hasher.isSolidFromPixels(checkerboard([200, 100, 0], [200, 100, 0])), true);
+});

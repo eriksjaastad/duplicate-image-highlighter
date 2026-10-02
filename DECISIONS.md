@@ -4,11 +4,11 @@ Short records of choices that shape the extension, and why. Newest first.
 
 ## Groups are recomputed from the images on the page (0.1.0)
 
-**Decision.** `extension/groups.js` keeps three things: which `<img>` elements are on the page and the URL each shows (replaced on every page scan), a bounded URL → hash cache, and a graph linking hashes that differ by at most 5 bits. Duplicate groups are the connected components of that graph, restricted to URLs currently on the page. Outlines and the toolbar count are redrawn from that result.
+**Decision.** `extension/groups.js` keeps which `<img>` elements are on the page and the URL each shows (replaced on every page scan), and a bounded URL → hash cache that never evicts a URL still on the page. Two URLs match when their hashes differ by at most 5 bits; duplicate groups are the connected components of that relation among URLs currently on the page. Outlines and the toolbar count are redrawn from that result.
 
 **Why.** Adding each new hash to the first existing group it matched made the result depend on the order images loaded (A~B and B~C, but A and C too far apart), and a group never shrank when an image was removed or changed its `src`. Recomputing from the live page fixes both, and keeps the cache from evicting URLs that are still shown.
 
-**Cost.** Each new hash is compared with every cached hash once (early exit past the threshold); the per-update recomputation is linear in the images on the page.
+**How it stays fast.** Comparing every hash with every other, or storing every matching pair, is quadratic: a few hundred near-identical images would stall the page. Instead each 992-bit hash is split into 6 bands. Two hashes within 5 bits differ in at most 5 bands, so they share at least one band exactly; an index from band to hashes therefore finds every possible match, and unrelated images are never compared. A union-find over the hashes on the page is extended as hashes arrive and rebuilt only when an image leaves, and a pair already in the same group is not compared again. On a laptop, 5,000 unrelated images take about 0.2 s to group in total; a single cluster of about 1,000 distinct near-identical images takes under 0.1 s to build or rebuild.
 
 ## Only the top frame is scanned (0.1.0)
 
