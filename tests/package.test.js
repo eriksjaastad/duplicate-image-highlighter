@@ -22,7 +22,17 @@ First public release.
 - First.
 `;
 
-// Copies the script and extension into a temp dir with the given CHANGELOG.
+function git(dir, ...args) {
+    const result = spawnSync('git', ['-C', dir, '-c', 'user.name=test', '-c', 'user.email=test@example.com', ...args], {
+        encoding: 'utf8',
+        timeout: 30000
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+}
+
+// A throwaway git repo with the script, the extension and the given CHANGELOG, committed.
 function fixture(changelog = CHANGELOG, version = '0.1.0') {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dih-package-'));
     fs.cpSync(path.join(ROOT, 'scripts'), path.join(dir, 'scripts'), { recursive: true });
@@ -32,7 +42,17 @@ function fixture(changelog = CHANGELOG, version = '0.1.0') {
     manifest.version = version;
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 4));
     fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), changelog);
+    git(dir, 'init', '-q');
+    git(dir, 'add', 'scripts', 'extension', 'CHANGELOG.md');
+    git(dir, 'commit', '-q', '-m', 'fixture');
     return dir;
+}
+
+function zipEntries(zip) {
+    const listing = spawnSync('unzip', ['-Z1', zip], { encoding: 'utf8', timeout: 30000 });
+    assert.equal(listing.error, undefined);
+    assert.equal(listing.status, 0, listing.stderr);
+    return listing.stdout.trim().split('\n').filter((f) => !f.endsWith('/')).sort();
 }
 
 function run(dir, ...args) {
@@ -53,9 +73,7 @@ test('builds a zip with the extension in a versioned folder, and its release not
     const zip = path.join(out, 'duplicate-image-highlighter-0.1.0.zip');
     assert.equal(stdout.trim(), zip);
 
-    const listing = spawnSync('unzip', ['-Z1', zip], { encoding: 'utf8', timeout: 30000 });
-    assert.equal(listing.status, 0);
-    const files = listing.stdout.trim().split('\n').filter((f) => !f.endsWith('/')).sort();
+    const files = zipEntries(zip);
     const expected = fs.readdirSync(path.join(ROOT, 'extension'))
         .map((f) => `duplicate-image-highlighter-0.1.0/${f}`).sort();
     assert.deepEqual(files, expected);
@@ -73,13 +91,51 @@ test('release notes stop at the next version section', () => {
 test('refuses when the manifest version differs from the tag', () => {
     const { status, stderr } = run(fixture(), '0.2.0');
     assert.equal(status, 1);
-    assert.match(stderr, /manifest\.json says 0\.1\.0, not 0\.2\.0/);
+    assert.match(stderr, /manifest\.json at HEAD says 0\.1\.0, not 0\.2\.0/);
+});
+
+test('packages the committed extension only, not local edits or untracked files', () => {
+    const dir = fixture();
+    fs.writeFileSync(path.join(dir, 'extension', '.DS_Store'), 'junk');
+    fs.appendFileSync(path.join(dir, 'extension', 'content.js'), '\n// uncommitted edit\n');
+    const { status, stderr, out } = run(dir, '0.1.0');
+    assert.equal(status, 0, stderr);
+    const zip = path.join(out, 'duplicate-image-highlighter-0.1.0.zip');
+    assert.equal(zipEntries(zip).some((f) => f.endsWith('.DS_Store')), false);
+    const packed = spawnSync('unzip', ['-p', zip, 'duplicate-image-highlighter-0.1.0/content.js'], { encoding: 'utf8', timeout: 30000 });
+    assert.equal(packed.status, 0);
+    assert.equal(packed.stdout.includes('uncommitted edit'), false);
+});
+
+test('two builds of the same commit are byte-identical', () => {
+    const dir = fixture();
+    const first = run(dir, '0.1.0');
+    assert.equal(first.status, 0, first.stderr);
+    const zip = path.join(first.out, 'duplicate-image-highlighter-0.1.0.zip');
+    const bytes = fs.readFileSync(zip);
+    fs.utimesSync(path.join(dir, 'extension', 'hash.js'), new Date(), new Date());
+    const second = run(dir, '0.1.0');
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(Buffer.compare(bytes, fs.readFileSync(zip)), 0);
+});
+
+test('accepts CRLF line endings and trailing whitespace on the heading', () => {
+    const changelog = '# Changelog\r\n\r\n## 0.1.0 (2026-10-02)  \r\n\r\n- First.\r\n';
+    const { status, stderr, out } = run(fixture(changelog), '0.1.0');
+    assert.equal(status, 0, stderr);
+    assert.equal(fs.readFileSync(path.join(out, 'release-notes.md'), 'utf8'), '- First.\n');
+});
+
+test('refuses an empty CHANGELOG section', () => {
+    const { status, stderr } = run(fixture('# Changelog\n\n## 0.1.0 (2026-10-02)\n\n## 0.0.1 (2026-09-01)\n\n- Old.\n'), '0.1.0');
+    assert.equal(status, 1);
+    assert.match(stderr, /is empty/);
 });
 
 test('refuses an undated or missing CHANGELOG section', () => {
     const undated = run(fixture('# Changelog\n\n## 0.1.0 (unreleased)\n\n- First.\n'), '0.1.0');
     assert.equal(undated.status, 1);
-    assert.match(undated.stderr, /needs a dated section/);
+    assert.match(undated.stderr, /needs a section headed exactly/);
     assert.equal(fs.existsSync(undated.out), false, 'nothing built');
 
     const missing = run(fixture('# Changelog\n'), '0.1.0');

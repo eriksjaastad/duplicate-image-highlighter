@@ -87,10 +87,10 @@ Tests run on every pull request.
 ### Releasing
 
 1. Set the version in `extension/manifest.json` and add a dated `## <version> (YYYY-MM-DD)` section to `CHANGELOG.md`.
-2. Merge that, then tag the merge commit: `git tag v<version> && git push origin v<version>`.
-3. The release workflow runs the tests, builds the zip with `scripts/package.sh` (which refuses a version or CHANGELOG mismatch) and publishes a GitHub Release with that CHANGELOG section as its notes.
+2. Merge that, then tag the merge commit on `main`: `git tag v<version> && git push origin v<version>`. Tags must be plain `vX.Y.Z`; the workflow refuses a tag whose commit is not on `main`.
+3. The release workflow runs the tests, builds the zip from the tagged commit with `scripts/package.sh` (which refuses a version or CHANGELOG mismatch) and publishes a GitHub Release with that CHANGELOG section as its notes.
 
-`scripts/package.sh <version>` builds the same zip locally under `dist/`.
+`scripts/package.sh <version>` builds the same zip locally under `dist/`, from the committed `HEAD` only.
 
 ## License
 
