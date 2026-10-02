@@ -1,7 +1,7 @@
 # macOS
 .DS_Store
 
-# Local agent / scratch
+# Local scratch
 .claude/
 .scratch/
 PROGRESS.md
