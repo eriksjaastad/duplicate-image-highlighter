@@ -31,12 +31,17 @@ fi
 # The section under "## <version> (YYYY-MM-DD)", up to the next "## " heading.
 # Tolerates CRLF line endings and trailing whitespace.
 notes="$(git -C "$root" show HEAD:CHANGELOG.md | awk -v v="$version" '
+    BEGIN {
+        literal_version = v; gsub(/[.]/, "[.]", literal_version)
+        heading = "^## " literal_version " [(][0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][)]$"
+    }
     { sub(/\r$/, ""); sub(/[ \t]+$/, "") }
+    done { next }
     index($0, "## " v " (") == 1 {
-        if ($0 !~ /\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)$/) { bad = 1; exit }
+        if ($0 !~ heading) { bad = 1; done = 1; next }
         found = 1; next
     }
-    found && /^## / { exit }
+    found && /^## / { done = 1; next }
     found { print }
     END { if (bad || !found) exit 1 }
 ' | sed '/./,$!d')" || {

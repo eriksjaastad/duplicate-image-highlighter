@@ -94,6 +94,17 @@ test('release notes stop at the next version section', () => {
     assert.equal(fs.readFileSync(path.join(out, 'release-notes.md'), 'utf8'), '- Second.\n');
 });
 
+test('packages a CHANGELOG over 100 KB under pipefail and keeps only the target section', () => {
+    const changelog = '# Changelog\n\n## 0.1.0 (2026-10-02)\n\n- First.\n\n' +
+        '## 0.0.1 (2026-09-01)\n\n' + '- Older release entry.\n'.repeat(16384);
+    assert.ok(Buffer.byteLength(changelog) > 100 * 1024);
+    // package.sh enables pipefail, so an early AWK exit would reject this history.
+    const { status, stderr, out } = run(fixture(changelog), '0.1.0');
+    assert.equal(status, 0, stderr);
+    assert.ok(fs.existsSync(path.join(out, 'duplicate-image-highlighter-0.1.0.zip')));
+    assert.equal(fs.readFileSync(path.join(out, 'release-notes.md'), 'utf8'), '- First.\n');
+});
+
 test('refuses when the manifest version differs from the tag', () => {
     const { status, stderr } = run(fixture(), '0.2.0');
     assert.equal(status, 1);
@@ -163,6 +174,19 @@ test('refuses an undated or missing CHANGELOG section', () => {
 
     const missing = run(fixture('# Changelog\n'), '0.1.0');
     assert.equal(missing.status, 1);
+});
+
+test('refuses release headings with extra labels, text or spaces', () => {
+    for (const heading of [
+        '## 0.1.0 (unreleased) (2026-10-02)',
+        '## 0.1.0 (2026-10-02) extra',
+        '## 0.1.0  (2026-10-02)'
+    ]) {
+        const { status, stderr, out } = run(fixture(`# Changelog\n\n${heading}\n\n- First.\n`), '0.1.0');
+        assert.equal(status, 1, heading);
+        assert.match(stderr, /needs a section headed exactly: ## 0\.1\.0 \(YYYY-MM-DD\)/);
+        assert.equal(fs.existsSync(out), false, 'nothing built');
+    }
 });
 
 test('refuses a version that is not major.minor.patch', () => {
