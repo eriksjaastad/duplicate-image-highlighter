@@ -60,9 +60,16 @@ function run(dir, ...args) {
 }
 
 function runIn(dir, tz, ...args) {
+    return runWith(dir, tz ? { TZ: tz } : { TZ: undefined }, ...args);
+}
+
+// Runs package.sh with extra environment; an undefined value removes that variable.
+function runWith(dir, extraEnv, ...args) {
     const out = path.join(dir, 'out');
     const env = { ...process.env, OUT_DIR: out };
-    if (tz) env.TZ = tz; else delete env.TZ;
+    for (const [key, value] of Object.entries(extraEnv)) {
+        if (value === undefined) delete env[key]; else env[key] = value;
+    }
     const result = spawnSync('bash', [path.join(dir, 'scripts', 'package.sh'), ...args], {
         env,
         encoding: 'utf8',
@@ -81,6 +88,7 @@ test('builds a zip with the extension in a versioned folder, and its release not
 
     const files = zipEntries(zip);
     const expected = fs.readdirSync(path.join(ROOT, 'extension'))
+        .filter((f) => f !== '.gitattributes')
         .map((f) => `duplicate-image-highlighter-0.1.0/${f}`).sort();
     assert.deepEqual(files, expected);
 
@@ -151,6 +159,45 @@ test('builds the same bytes in any timezone', () => {
     const west = runIn(dir, 'America/Los_Angeles', '0.1.0');
     assert.equal(west.status, 0, west.stderr);
     assert.equal(Buffer.compare(bytes, zip(west.out)), 0);
+});
+
+test('builds the same bytes when the machine converts line endings', () => {
+    const dir = fixture();
+    const zipPath = (out) => path.join(out, 'duplicate-image-highlighter-0.1.0.zip');
+    const plain = runWith(dir, { GIT_CONFIG_COUNT: undefined }, '0.1.0');
+    assert.equal(plain.status, 0, plain.stderr);
+    const bytes = fs.readFileSync(zipPath(plain.out));
+    const packed = spawnSync('unzip', ['-p', zipPath(plain.out), 'duplicate-image-highlighter-0.1.0/content.js'], { timeout: 30000 });
+    assert.equal(packed.status, 0);
+    assert.equal(packed.stdout.includes(0x0d), false, 'packaged with LF line endings');
+
+    // Config a Windows checkout or a global attributes file would bring, which
+    // without the guards makes git archive write every file with CRLF.
+    const attributes = path.join(dir, 'global-attributes');
+    fs.writeFileSync(attributes, '* text eol=crlf\n');
+    const converting = runWith(dir, {
+        GIT_CONFIG_COUNT: '3',
+        GIT_CONFIG_KEY_0: 'core.autocrlf', GIT_CONFIG_VALUE_0: 'true',
+        GIT_CONFIG_KEY_1: 'core.eol', GIT_CONFIG_VALUE_1: 'crlf',
+        GIT_CONFIG_KEY_2: 'core.attributesFile', GIT_CONFIG_VALUE_2: attributes
+    }, '0.1.0');
+    assert.equal(converting.status, 0, converting.stderr);
+    assert.equal(Buffer.compare(bytes, fs.readFileSync(zipPath(converting.out))), 0);
+
+    // package.sh's own overrides hold even without extension/.gitattributes.
+    const bare = fixture();
+    git(bare, 'rm', '-q', 'extension/.gitattributes');
+    git(bare, 'commit', '-q', '-m', 'no attributes');
+    const bareBuild = runWith(bare, { GIT_CONFIG_COUNT: undefined }, '0.1.0');
+    assert.equal(bareBuild.status, 0, bareBuild.stderr);
+    const bareBytes = fs.readFileSync(zipPath(bareBuild.out));
+    const bareConverting = runWith(bare, {
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'core.autocrlf', GIT_CONFIG_VALUE_0: 'true',
+        GIT_CONFIG_KEY_1: 'core.eol', GIT_CONFIG_VALUE_1: 'crlf'
+    }, '0.1.0');
+    assert.equal(bareConverting.status, 0, bareConverting.stderr);
+    assert.equal(Buffer.compare(bareBytes, fs.readFileSync(zipPath(bareConverting.out))), 0);
 });
 
 test('accepts CRLF line endings and trailing whitespace on the heading', () => {

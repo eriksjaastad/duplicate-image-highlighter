@@ -94,4 +94,4 @@ Tests run on every pull request.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — Copyright (c) 2026 Erik Sjaastad

@@ -57,9 +57,10 @@ name="duplicate-image-highlighter-$version"
 mkdir -p "$out"
 # A tree (HEAD:extension) carries no time of its own, so stamp every entry
 # with the commit time; zip entry times are local, so build in UTC. The same
-# commit then builds the same bytes on any machine.
+# commit then builds the same bytes on any machine. Line-ending conversion is
+# off here (-c wins over the user's config) and in extension/.gitattributes.
 commit_time="$(git -C "$root" log -1 --format=%cI HEAD)"
-TZ=UTC git -C "$root" archive --format=zip --prefix="$name/" --mtime="$commit_time" -o "$out/$name.zip" HEAD:extension
+TZ=UTC git -C "$root" -c core.autocrlf=false -c core.eol=lf archive --format=zip --prefix="$name/" --mtime="$commit_time" -o "$out/$name.zip" HEAD:extension
 printf '%s\n' "$notes" > "$out/release-notes.md"
 
 echo "$out/$name.zip"
