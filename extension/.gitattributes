@@ -1,0 +1,5 @@
+# Release zips (scripts/package.sh) are archived from this tree, so this file is
+# the attribute source for them. Ship committed bytes as-is: no line-ending,
+# filter or encoding conversion, whatever a machine's global attributes say.
+* -text -ident -filter -working-tree-encoding
+.gitattributes export-ignore

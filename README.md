@@ -22,11 +22,13 @@ The toolbar badge shows `…` while images are being compared, then the number o
 
 There is no Chrome Web Store listing; you load the extension from this repository.
 
-1. Download the code: click **Code → Download ZIP** on GitHub and unzip it, or `git clone` the repository.
+1. Download `duplicate-image-highlighter-<version>.zip` from the [latest release](../../releases/latest) and unzip it.
 2. Open `chrome://extensions` in Chrome.
 3. Turn on **Developer mode** (top right).
-4. Click **Load unpacked** and choose the `extension` folder inside the download.
+4. Click **Load unpacked** and choose the unzipped `duplicate-image-highlighter-<version>` folder (the one containing `manifest.json`).
 5. Optional: click the puzzle-piece icon in the toolbar and pin **Duplicate Image Highlighter**.
+
+To run the newest unreleased code instead, `git clone` the repository (or **Code → Download ZIP**) and choose its `extension` folder in step 4.
 
 Chrome will say the extension can "read and change your data on all websites". That permission is what lets it download images from other domains to compare their pixels (see [Permissions](#permissions)); it never runs on a page you have not clicked it on.
 
@@ -80,6 +82,16 @@ node --test tests/*.test.js     # unit tests (hashing, grouping, page script, se
 
 After editing files under `extension/`, click the reload icon on the extension's card in `chrome://extensions`.
 
+Tests run on every pull request.
+
+### Releasing
+
+1. Set the version in `extension/manifest.json` and add a dated `## <version> (YYYY-MM-DD)` section to `CHANGELOG.md`.
+2. Merge that, then tag the merge commit on `main`: `git tag v<version> && git push origin v<version>`. Tags must be plain `vX.Y.Z`; the workflow refuses a tag whose commit is not on `main`.
+3. The release workflow runs the tests, builds the zip from the tagged commit with `scripts/package.sh` (which refuses a version or CHANGELOG mismatch) and publishes a GitHub Release with that CHANGELOG section as its notes.
+
+`scripts/package.sh <version>` builds the same zip locally under `dist/`, from the committed `HEAD` only.
+
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — Copyright (c) 2026 Erik Sjaastad
