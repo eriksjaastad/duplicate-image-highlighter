@@ -18,10 +18,12 @@
  * - Images are hashed when they come within 500px of the viewport
  *   (IntersectionObserver, rootMargin 500px), at most 5 at a time.
  * - DOM changes under document.body trigger the observe pass 500ms after
- *   they stop. The first pass runs 500ms after the click.
+ *   they stop; adding or removing our own stripe and pill does not. The first
+ *   pass runs 500ms after the click.
  * - A URL that failed to hash is not retried until Alt+Shift+R.
  * - A URL is hashed once at a time: other images showing it while its hash
- *   is in flight wait for that result instead of queueing it again.
+ *   is in flight wait for that result instead of queueing it again. One whose
+ *   src has changed by the time it finishes is not marked (nor hashed again).
  * - An image removed from the page before it came near the viewport is no
  *   longer watched.
  *
@@ -334,7 +336,10 @@
         // Another image with this URL is already being hashed: share its result
         const pending = pendingHashes.get(src);
         if (pending) {
-            pending.then(() => remark(img, src));
+            // Unless this image has since moved on to another URL
+            pending.then(() => {
+                if (getImageSrc(img) === src) remark(img, src);
+            });
             return;
         }
 
@@ -470,8 +475,24 @@
 
     // --- PAGE CHANGES (infinite scroll, SPAs) ---
 
+    function isOwnDecoration(node) {
+        return Boolean(node.classList) &&
+            (node.classList.contains('dih-stripe') || node.classList.contains('dih-count'));
+    }
+
+    /**
+     * A change that only adds or removes our own stripes and pills. Two images
+     * sharing a parent with different counts swap them on every pass, so
+     * counting these as page changes would rescan forever.
+     */
+    function isOwnDecorationChange(mutation) {
+        const nodes = [...mutation.addedNodes, ...mutation.removedNodes];
+        return nodes.length > 0 && nodes.every(isOwnDecoration);
+    }
+
     let debounceTimer = null;
-    const domObserver = new MutationObserver(() => {
+    const domObserver = new MutationObserver((mutations) => {
+        if (mutations.every(isOwnDecorationChange)) return;
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(observeNewImages, 500);
     });

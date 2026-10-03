@@ -5,7 +5,8 @@
 // Options: `serialize` rewrites every inline style value on write, the way a
 // browser re-serializes colors; `deferred` holds each hash until
 // page.resolveHash(src); `liveMutations` fires the MutationObserver callback on
-// every child added to or removed from the page.
+// every child added to or removed from the page, with a record naming that child.
+// page.mutate() with no records stands for an unrelated page change.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -52,6 +53,9 @@ class FakeElement {
         this.textContent = '';
         this.computedPosition = 'static'; // what the page's stylesheets say
     }
+    get classList() {
+        return { contains: (cls) => this.className.split(' ').includes(cls) };
+    }
     get isConnected() {
         let el = this;
         while (el.parentElement) el = el.parentElement;
@@ -61,16 +65,17 @@ class FakeElement {
         if (child.parentElement) child.remove();
         child.parentElement = this;
         this.children.push(child);
-        if (this.isConnected) this.page.childListChanged();
+        if (this.isConnected) this.page.childListChanged({ addedNodes: [child], removedNodes: [] });
         return child;
     }
     remove() {
         if (!this.parentElement) return;
         const connected = this.parentElement.isConnected;
+        const record = { addedNodes: [], removedNodes: [this] };
         const siblings = this.parentElement.children;
         siblings.splice(siblings.indexOf(this), 1);
         this.parentElement = null;
-        if (connected) this.page.childListChanged();
+        if (connected) this.page.childListChanged(record);
     }
     setAttribute(name, value) { this.attributes[name] = String(value); }
     getAttribute(name) { return this.attributes[name] ?? null; }
@@ -108,9 +113,9 @@ function loadPage(hashes = {}, { serialize = null, deferred = false, liveMutatio
         keyListeners: [], logs: [], tables: [], reloads: 0, constructed: { intersection: 0, mutation: 0 },
         serialize, childListChanges: 0, waiting: new Map()
     };
-    page.childListChanged = () => {
+    page.childListChanged = (record) => {
         page.childListChanges++;
-        if (liveMutations && page.mutate) page.mutate();
+        if (liveMutations && page.mutate) page.mutate([record]);
     };
     // Release a deferred hash and let its result settle.
     page.resolveHash = async (src) => {
@@ -158,7 +163,11 @@ function loadPage(hashes = {}, { serialize = null, deferred = false, liveMutatio
             unobserve(el) { page.observed.delete(el); }
         },
         MutationObserver: class {
-            constructor(callback) { page.constructed.mutation++; page.mutate = callback; }
+            constructor(callback) {
+                page.constructed.mutation++;
+                page.mutate = (records = [{ addedNodes: [new FakeElement('div', page)], removedNodes: [] }]) =>
+                    callback(records, this);
+            }
             observe(target, options) { page.mutationTarget = target; page.mutationOptions = options; }
         }
     };
@@ -540,18 +549,50 @@ test('re-marking with the same count leaves the page alone, so the scan settles'
     const [stripe] = stripeOf(late);
     const [pill] = pillOf(late);
 
-    // The pass that marked it changed the page, so one more pass is due; that one changes nothing.
-    assert.equal(page.timers.size, 1);
+    // Adding our own stripe and pill schedules no pass; a repeat pass changes nothing.
+    assert.equal(page.timers.size, 0, 'no pass scheduled by our own decorations');
     const changes = page.childListChanges;
-    page.runTimers();
+    page.press('KeyS');
     assert.equal(page.childListChanges, changes, 'no stripe or pill removed or added');
-    assert.equal(page.timers.size, 0, 'no further pass scheduled');
+    assert.equal(page.timers.size, 0);
     assert.equal(stripeOf(late)[0], stripe);
     assert.equal(pillOf(late)[0], pill);
+});
 
+test('two images sharing a parent with different counts do not keep rescheduling the scan', async () => {
+    const urls = {
+        a: 'https://x.example/a.jpg', a2: 'https://x.example/a2.jpg',
+        b: 'https://x.example/b.jpg', b2: 'https://x.example/b2.jpg', b3: 'https://x.example/b3.jpg'
+    };
+    const B = hashWithFlips(100, 40);
+    const page = loadPage(
+        { [urls.a]: BASE, [urls.a2]: BASE, [urls.b]: B, [urls.b2]: B, [urls.b3]: B },
+        { liveMutations: true }
+    );
+    for (const src of Object.values(urls)) page.addImage(src);
+    await page.settle();
+    page.runTimers(); // the pass the decorations above used to schedule, if any
+
+    // Known URLs, never observed: every pass remarks both, and each replaces the other's pill.
+    const shared = page.body.appendChild(new FakeElement('div', page));
+    const imgA = shared.appendChild(new FakeImg(page, urls.a));
+    const imgB = shared.appendChild(new FakeImg(page, urls.b));
+    assert.equal(page.timers.size, 1, 'adding the images schedules a pass');
+    const changes = page.childListChanges;
+    page.runTimers();
+    assert.ok(page.childListChanges > changes, 'the pass swapped the shared stripe and pill');
+    assert.equal(pillOf(imgB)[0].textContent, '3');
+    assert.equal(imgA.style.outline, `3px solid hsl(${expectedStyles(2).hue}, 100%, 50%)`);
+
+    assert.equal(page.timers.size, 0, 'our own stripe and pill swaps schedule no pass');
+    const swapped = page.childListChanges;
     page.press('KeyS');
-    assert.equal(page.childListChanges, changes);
-    assert.equal(page.timers.size, 0);
+    assert.ok(page.childListChanges > swapped, 'a rescan swaps them again');
+    assert.equal(page.timers.size, 0, 'and still schedules no pass');
+
+    // A real page change still schedules one.
+    page.body.appendChild(new FakeElement('div', page));
+    assert.equal(page.timers.size, 1);
 });
 
 test('a page that rewrote the outline or pill gets it back, without touching what still matches', () => {
@@ -615,6 +656,27 @@ test('a URL whose hash is in flight is not queued again; its other images share 
     await page.resolveHash(urls.a);
     for (const img of [a1, a2, b]) assertMarked(img, 2);
     assert.deepEqual(page.hashed, [urls.a, urls.b], 'each URL hashed once');
+});
+
+test('an image waiting on an in-flight hash is not marked if its src changed meanwhile', async () => {
+    const urls = { a: 'https://x.example/a.jpg', b: 'https://x.example/b.jpg', unique: 'https://x.example/unique.jpg' };
+    const page = loadPage({ [urls.a]: BASE, [urls.b]: BASE }, { deferred: true });
+    const first = page.addImage(urls.a);
+    const second = page.addImage(urls.a);
+    const b = page.addImage(urls.b);
+    page.runTimers();
+    await page.scroll([first]);
+    await page.scroll([second, b]);
+    await page.resolveHash(urls.b);
+
+    second.src = second.currentSrc = urls.unique;
+    await page.resolveHash(urls.a);
+    assertMarked(first, 2);
+    assertMarked(b, 2);
+    assert.equal(isMarked(second), false);
+    assert.deepEqual(pillOf(second), []);
+    assert.equal(second.style.outline, undefined);
+    assert.deepEqual(page.hashed, [urls.a, urls.b], 'the new URL is not hashed');
 });
 
 test('the in-flight mark clears when the hash finishes', async () => {
