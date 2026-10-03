@@ -43,34 +43,13 @@
 
     /**
      * Enqueues a request to hash an image URL.
-     * Returns a Promise that resolves to { hash, solid }, null on failure, or
-     * { dropped: true } if dropQueued() removed it before it started.
+     * Returns a Promise that resolves to the hex hash string, or null on failure.
      */
     function queueHash(url) {
         return new Promise((resolve) => {
             queue.push({ url, resolve });
             processQueue();
         });
-    }
-
-    /**
-     * Drop queued (not yet started) hashes whose URL `isUnwanted(url)` says
-     * are no longer needed; their promises resolve to { dropped: true }.
-     * Hashes already in flight finish normally.
-     */
-    function dropQueued(isUnwanted) {
-        for (let i = queue.length - 1; i >= 0; i--) {
-            if (!isUnwanted(queue[i].url)) continue;
-            const [task] = queue.splice(i, 1);
-            task.resolve({ dropped: true });
-        }
-    }
-
-    /**
-     * Number of hashes queued or in flight.
-     */
-    function pendingCount() {
-        return queue.length + activeCount;
     }
 
     function processQueue() {
@@ -95,9 +74,9 @@
     /**
      * Steps:
      * 1. Ask the service worker to fetch the image (cross-origin pixels).
-     * 2. Decode the bytes (createImageBitmap on a Blob; SVG via the data URL).
-     * 3. Draw it onto the 32x32 canvas, over white.
-     * 4. Compute the dHash, and whether the image is one flat color.
+     * 2. Decode it.
+     * 3. Draw it onto the cleared 32x32 canvas.
+     * 4. Compute the dHash.
      */
     async function computeHashInternal(url) {
         const dataUrl = await fetchImageViaBackground(url);
@@ -105,54 +84,21 @@
 
         const img = await decodeImage(dataUrl);
 
-        // Composite onto white: transparent pixels would otherwise read as
-        // black (0, 0, 0, 0), hiding a shape drawn on a transparent background.
         try {
-            ctx.fillStyle = '#fff';
-            ctx.fillRect(0, 0, TARGET_SIZE, TARGET_SIZE);
+            ctx.clearRect(0, 0, TARGET_SIZE, TARGET_SIZE);
             ctx.drawImage(img, 0, 0, TARGET_SIZE, TARGET_SIZE);
         } finally {
             if (img.close) img.close(); // ImageBitmap: free the decoded pixels now
         }
 
         const pixels = ctx.getImageData(0, 0, TARGET_SIZE, TARGET_SIZE).data; // RGBA
-        return { hash: dHashFromPixels(pixels, TARGET_SIZE), solid: isSolidFromPixels(pixels) };
-    }
-
-    /**
-     * Per-channel standard deviation below which an image counts as one flat
-     * color (a placeholder). Re-encoding noise stays well under it; any visible
-     * pattern or gradient is far above it.
-     */
-    const SOLID_MAX_STDDEV = 2;
-
-    /**
-     * True when every pixel in the RGBA buffer has nearly the same color and
-     * opacity. Hashed images are drawn over white, so their alpha is always
-     * flat by the time they get here; checking it keeps this function correct
-     * for any RGBA buffer, not only composited ones.
-     * The hash alone cannot tell: a smooth left-to-right gradient also hashes
-     * to all zero (or all one) bits. Each channel is checked on its own, since
-     * a pattern of different colors can have one brightness throughout.
-     */
-    function isSolidFromPixels(pixels) {
-        const count = pixels.length / 4;
-        for (let channel = 0; channel < 4; channel++) {
-            let sum = 0;
-            let sumSquares = 0;
-            for (let i = channel; i < pixels.length; i += 4) {
-                sum += pixels[i];
-                sumSquares += pixels[i] * pixels[i];
-            }
-            const mean = sum / count;
-            if (sumSquares / count - mean * mean >= SOLID_MAX_STDDEV * SOLID_MAX_STDDEV) return false;
-        }
-        return true;
+        return dHashFromPixels(pixels, TARGET_SIZE);
     }
 
     /**
      * Difference hash over a size x size RGBA pixel buffer, row by row.
-     * Each bit is 1 when a pixel is brighter than its right-hand neighbour.
+     * Each bit is 1 when a pixel's RGB average is strictly greater than its
+     * right-hand neighbour's.
      */
     function dHashFromPixels(pixels, size) {
         let bits = '';
@@ -185,9 +131,12 @@
     }
 
     /**
-     * Decode image bytes without loading a URL into the page: a page whose
-     * Content-Security-Policy leaves `data:` out of img-src blocks
-     * `new Image()` with a data URL, but not createImageBitmap on a Blob.
+     * Why a Blob and createImageBitmap: this script runs inside whatever page
+     * the user clicked, and a page whose Content-Security-Policy leaves `data:`
+     * out of img-src blocks `new Image()` with a data URL. createImageBitmap on
+     * a Blob decodes the same bytes without asking the page. It changes only
+     * how the bytes are decoded, never what is drawn: the bitmap goes onto the
+     * same cleared canvas as an Image would, with no fill and no matte.
      * Formats createImageBitmap cannot decode (SVG) fall back to the data URL.
      */
     async function decodeImage(dataUrl) {
@@ -232,7 +181,7 @@
     }
 
     /**
-     * Converts a binary string to hexadecimal.
+     * Converts a binary string to hexadecimal, 4 bits at a time.
      * A final chunk shorter than 4 bits is right-padded with '0' bits.
      */
     function binToHex(bin) {
@@ -245,12 +194,11 @@
     }
 
     /**
-     * Hamming distance between two hex hash strings.
+     * Hamming distance between two hex hash strings: the popcount of the XOR
+     * of each pair of hex digits.
      * Returns Infinity when either is missing or the lengths differ.
-     * With a limit, stops counting as soon as the distance exceeds it and
-     * returns that partial count (still > limit).
      */
-    function hammingDistance(h1, h2, limit = Infinity) {
+    function hammingDistance(h1, h2) {
         if (!h1 || !h2 || h1.length !== h2.length) return Infinity;
 
         let distance = 0;
@@ -260,19 +208,15 @@
                 distance += mask & 1;
                 mask >>= 1;
             }
-            if (distance > limit) return distance;
         }
         return distance;
     }
 
     window.DuplicateImageHash = {
         queueHash,
-        dropQueued,
-        pendingCount,
         hammingDistance,
         // Exposed for tests
         binToHex,
-        dHashFromPixels,
-        isSolidFromPixels
+        dHashFromPixels
     };
 })();

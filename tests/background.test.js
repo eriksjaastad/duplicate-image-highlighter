@@ -186,32 +186,34 @@ test('aborts a stalled fetch after the timeout', async () => {
     assert.match(res.error, /aborted/);
 });
 
-test('ignores messages that do not come from our own content script', () => {
-    const { listeners, badge } = loadBackground(async () => { throw new Error('must not fetch'); });
+test('ignores messages that do not come from our own content script', async () => {
+    let fetched = false;
+    const { listeners } = loadBackground(async () => { fetched = true; return imageResponse(new Uint8Array([1])); });
     const noTab = listeners.message({ action: 'FETCH_IMAGE_BLOB', url: 'https://x.example/a.png' }, { id: EXTENSION_ID }, () => {});
-    const otherExtension = listeners.message({ action: 'SCAN_STATUS', pending: 0, groups: 3 }, { id: 'other', tab: { id: 1 } }, () => {});
+    const otherExtension = listeners.message({ action: 'FETCH_IMAGE_BLOB', url: 'https://x.example/a.png' }, { id: 'other', tab: { id: 1 } }, () => {});
+    await new Promise((r) => setImmediate(r));
     assert.equal(noTab, false);
     assert.equal(otherExtension, false);
-    assert.equal(badge.length, 0);
+    assert.equal(fetched, false);
 });
 
-test('badge shows progress, then the group count', () => {
+test('there is no scan-status message: the badge never shows progress or a group count', () => {
     const { listeners, badge } = loadBackground(async () => {});
-    listeners.message({ action: 'SCAN_STATUS', pending: 4, groups: 1 }, tabSender, () => {});
-    listeners.message({ action: 'SCAN_STATUS', pending: 0, groups: 3 }, tabSender, () => {});
-    listeners.message({ action: 'SCAN_STATUS', pending: 0, groups: 0 }, tabSender, () => {});
-    const texts = badge.filter(([kind]) => kind === 'text').map(([, o]) => [o.tabId, o.text]);
-    assert.deepEqual(texts, [[7, '…'], [7, '3'], [7, '0']]);
+    const handled = listeners.message({ action: 'SCAN_STATUS', pending: 0, groups: 3 }, tabSender, () => {});
+    assert.equal(handled, false);
+    assert.equal(badge.length, 0);
+    assert.doesNotMatch(SOURCE, /SCAN_STATUS|'…'/);
 });
 
-test('toolbar click injects the hasher, grouper and scanner into the top frame only', async () => {
-    const { listeners, injected } = loadBackground(async () => {});
+test('toolbar click injects the hasher, then the page script, into the top frame only', async () => {
+    const { listeners, injected, badge } = loadBackground(async () => {});
     await listeners.click({ id: 9 });
     assert.equal(injected.length, 1);
     assert.deepEqual(JSON.parse(JSON.stringify(injected[0])), {
         target: { tabId: 9 },
-        files: ['hash.js', 'groups.js', 'content.js']
+        files: ['hash.js', 'content.js']
     });
+    assert.equal(badge.length, 0);
 });
 
 test('a page that refuses injection gets an × badge', async () => {

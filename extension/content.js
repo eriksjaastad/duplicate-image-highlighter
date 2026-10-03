@@ -1,7 +1,38 @@
 /**
- * Content script, injected into the top frame of a tab when the toolbar
- * button is clicked. Hashes images as they approach the viewport and
- * highlights every image that looks like another image on the same page.
+ * Content script. Nothing runs until you click the toolbar button: the click
+ * injects hash.js and then this file into the clicked tab's top frame only
+ * (no iframes). Clicking again runs the observe pass again (a rescan); it does
+ * not add a second observer or a second set of shortcuts.
+ *
+ * What counts as a duplicate:
+ * - Two different image URLs whose 32x32 difference hashes (992 bits) are
+ *   within Hamming distance 5 (HAMMING_THRESHOLD). The same URL twice is not
+ *   a duplicate.
+ * - A new hash joins the first stored hash within 5 bits, in the order
+ *   hashes arrive. Matches do not chain: A~B and B~C does not put A with C.
+ * - Skipped: images with no src, data: URLs, and images whose natural size
+ *   is not greater than 100x50 (naturalWidth > 100 and naturalHeight > 50).
+ * - Skipped: hashes that are all 0 or all f (flat placeholders).
+ *
+ * When to look:
+ * - Images are hashed when they come within 500px of the viewport
+ *   (IntersectionObserver, rootMargin 500px), at most 5 at a time.
+ * - DOM changes under document.body trigger the observe pass 500ms after
+ *   they stop. The first pass runs 500ms after the click.
+ * - A URL that failed to hash is not retried until Alt+Shift+R.
+ *
+ * What you see on each image whose look-alike group has N > 1 URLs:
+ * - with t = (min(N, 10) - 1) / 9, hue = 200 - 200 * t (blue at 2, red at 10+)
+ * - a 3px solid outline in that hue, offset -4px, on the image
+ * - div.dih-stripe: a striped overlay covering the image's parent, with
+ *   45deg stripes 20 - 15 * t pixels wide
+ * - div.dih-count: a pill in the parent's top-right corner showing N
+ * A parent with position static is made position relative to hold them.
+ *
+ * Keyboard shortcuts:
+ * - Alt+Shift+R: forget every hash and failure, and reload the page
+ * - Alt+Shift+D: log a debug dump to the console (counts and duplicate groups)
+ * - Alt+Shift+S: run the observe pass again (rescan)
  *
  * All state is in memory, per tab, and gone on navigation or reload.
  */
@@ -14,7 +45,6 @@
 
     const LOG_PREFIX = '[DuplicateImageHighlighter]';
     const DuplicateImageHash = window.DuplicateImageHash;
-    const DuplicateImageGroups = window.DuplicateImageGroups;
 
     // --- CONFIGURATION ---
 
@@ -25,22 +55,16 @@
      *
      * With a 32x31 dHash (992 bits / 248 hex chars), typical thresholds:
      * - 0: Exact match only
-     * - 5: Very similar images (resized, re-encoded, compression artifacts) [RECOMMENDED]
+     * - 5: Very similar images (compression artifacts, slight crops) [RECOMMENDED]
      * - 10: Moderately similar (same scene, different quality)
      * - 15+: Loose matching (may catch unrelated images)
      */
     const HAMMING_THRESHOLD = 5;
 
     /**
-     * Images smaller than this are skipped (icons, spacers, avatars).
-     */
-    const MIN_WIDTH = 100;
-    const MIN_HEIGHT = 50;
-
-    /**
-     * Maximum number of image URLs to remember hashes for.
+     * Maximum number of entries to keep in memory maps.
      * Prevents unbounded memory growth on infinite-scroll pages.
-     * When the limit is reached, the oldest URLs no longer on the page are evicted.
+     * When the limit is reached, the oldest entries are evicted.
      */
     const MAX_CACHE_ENTRIES = 5000;
 
@@ -50,113 +74,124 @@
      */
     const MAX_FAILED_ENTRIES = 1000;
 
-    /**
-     * DOM changes and image loads are handled at most this often (ms), however
-     * busy the page is.
-     */
-    const MUTATION_INTERVAL = 500;
-
-    /**
-     * Highlights are recomputed at most this often (ms) while hashes arrive.
-     */
-    const RENDER_INTERVAL = 100;
-
     // --- VISUAL STYLING ---
 
     /**
-     * Outline color by number of look-alike files: blue (2) to red (10+),
-     * sweeping the hue wheel through cyan, green and yellow in between.
+     * Styles by duplicate count: blue at 2 copies, shading to red at 10 or more.
+     * Returns null for a count of 1 or less.
      */
-    function colorForCount(count) {
+    function styleForCount(count) {
+        if (count <= 1) return null;
+
         const maxCount = 10; // Cap at 10 for max redness
-        const t = (Math.min(count, maxCount) - 2) / (maxCount - 2); // 0 at 2 copies, 1 at maxCount
+        const t = (Math.min(count, maxCount) - 1) / (maxCount - 1); // 0..1
         const hue = 200 - (200 * t);
-        return `hsl(${hue}, 100%, 50%)`;
-    }
 
-    // --- HIGHLIGHTS ---
-    //
-    // A highlight is an outline drawn inside the image's own edge. Outlines take
-    // no space, so the page layout never moves, and the browser keeps them
-    // correctly clipped, layered and in place through scrolling and animation.
-    // Each property's previous inline value is saved and restored on clear.
+        // Wider stripes for a low count, tighter for a high one: 20px -> 5px
+        const stripeWidth = 20 - (15 * t);
+        const colorA = `hsla(${hue}, 100%, 50%, 0.3)`;
+        const colorB = `hsla(${hue}, 100%, 50%, 0.05)`;
 
-    // Longhands, not the `outline` shorthand: a page may set just one of them
-    // inline (say outline-color), which the shorthand cannot read back.
-    const OUTLINE_PROPS = ['outline-width', 'outline-style', 'outline-color', 'outline-offset'];
-
-    // img element -> { count, props: { [prop]: { value, priority, applied } } }
-    // value/priority: the page's inline value to restore; applied: what we set
-    // (always with 'important' priority).
-    const decorations = new Map();
-
-    // True while a property still holds exactly what we set, value and priority.
-    function stillOurs(img, prop, state) {
-        return img.style.getPropertyValue(prop) === state.applied
-            && img.style.getPropertyPriority(prop) === 'important';
-    }
-
-    function clearDecoration(img) {
-        const entry = decorations.get(img);
-        if (!entry) return;
-        decorations.delete(img);
-        for (const prop of OUTLINE_PROPS) {
-            const state = entry.props[prop];
-            const { value, priority } = state;
-            // If the page changed this property since we set it, the page's value wins.
-            if (!stillOurs(img, prop, state)) continue;
-            if (value) {
-                img.style.setProperty(prop, value, priority);
-            } else {
-                img.style.removeProperty(prop);
-            }
-        }
-    }
-
-    function markDuplicate(img, count) {
-        let entry = decorations.get(img);
-        if (!entry) {
-            entry = { count: 0, props: {} };
-            for (const prop of OUTLINE_PROPS) entry.props[prop] = { applied: null };
-            decorations.set(img, entry);
-        }
-        const wanted = {
-            'outline-width': '4px',
-            'outline-style': 'solid',
-            'outline-color': colorForCount(count),
-            'outline-offset': '-4px'
+        return {
+            outline: `3px solid hsl(${hue}, 100%, 50%)`,
+            outlineOffset: '-4px',
+            backgroundImage: `repeating-linear-gradient(45deg, ${colorA}, ${colorA} 2px, ${colorB} 2px, ${colorB} ${stripeWidth}px)`,
+            badgeBg: `hsl(${hue}, 100%, 30%)`,
+            badgeColor: '#fff',
+            zIndex: 1000 + count
         };
-        for (const prop of OUTLINE_PROPS) {
-            const state = entry.props[prop];
-            const ours = stillOurs(img, prop, state);
-            if (entry.count === count && ours) continue;
-            // First time, or the page set its own value since: that is what to restore.
-            if (!ours) {
-                state.value = img.style.getPropertyValue(prop);
-                state.priority = img.style.getPropertyPriority(prop);
-            }
-            // important: page stylesheets must not hide the highlight
-            img.style.setProperty(prop, wanted[prop], 'important');
-            state.applied = img.style.getPropertyValue(prop);
-        }
-        entry.count = count;
     }
 
-    // --- STATE ---
+    /**
+     * Marks an image as one of `count` look-alikes: outline on the image,
+     * stripe overlay and count pill on its parent.
+     */
+    function markDuplicate(img, count) {
+        const parent = img.parentElement;
+        if (!parent) return;
 
-    const tracker = DuplicateImageGroups.createTracker({
-        threshold: HAMMING_THRESHOLD,
-        maxCacheEntries: MAX_CACHE_ENTRIES,
-        maxFailedEntries: MAX_FAILED_ENTRIES
-    });
+        // Remove the previous decoration
+        const existingCount = parent.querySelector('.dih-count');
+        if (existingCount) existingCount.remove();
+        const existingStripe = parent.querySelector('.dih-stripe');
+        if (existingStripe) existingStripe.remove();
 
-    // img element -> src it was handed to the IntersectionObserver with
-    const watching = new Map();
+        if (count <= 1) {
+            img.style.outline = '';
+            return;
+        }
 
-    // Images with a pending 'load' listener, so a rescan does not add a second one
-    const awaitingLoad = new WeakSet();
+        const styles = styleForCount(count);
 
-    let groupCount = 0;
+        img.style.outline = styles.outline;
+        img.style.outlineOffset = styles.outlineOffset;
+
+        // The overlay and pill are positioned against the parent
+        if (window.getComputedStyle(parent).position === 'static') {
+            parent.style.position = 'relative';
+        }
+
+        const stripe = document.createElement('div');
+        stripe.className = 'dih-stripe';
+        Object.assign(stripe.style, {
+            position: 'absolute',
+            top: '0',
+            left: '0',
+            width: '100%',
+            height: '100%',
+            backgroundImage: styles.backgroundImage,
+            pointerEvents: 'none',
+            zIndex: String(styles.zIndex - 1),
+            borderRadius: 'inherit'
+        });
+        parent.appendChild(stripe);
+
+        const pill = document.createElement('div');
+        pill.className = 'dih-count';
+        pill.textContent = String(count);
+        pill.setAttribute('title', `Duplicate: ${count} copies on this page`);
+        Object.assign(pill.style, {
+            position: 'absolute',
+            top: '4px',
+            right: '4px',
+            backgroundColor: styles.badgeBg,
+            color: styles.badgeColor,
+            padding: '2px 6px',
+            borderRadius: '12px',
+            fontSize: '12px',
+            fontWeight: 'bold',
+            fontFamily: 'sans-serif',
+            zIndex: String(styles.zIndex),
+            boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
+            pointerEvents: 'none'
+        });
+        parent.appendChild(pill);
+    }
+
+    // --- HASH MATCHING ---
+
+    /**
+     * The hash key a new hash belongs to: itself if already stored, otherwise
+     * the first stored hash within HAMMING_THRESHOLD bits, otherwise null.
+     */
+    function findMatchingHash(newHash, hashMap) {
+        if (hashMap.has(newHash)) return newHash;
+
+        for (const existingHash of hashMap.keys()) {
+            if (DuplicateImageHash.hammingDistance(newHash, existingHash) <= HAMMING_THRESHOLD) {
+                return existingHash;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Flat placeholders hash to all 0 or all f bits.
+     */
+    function isSolidColor(hash) {
+        if (!hash) return false;
+        return /^0+$/.test(hash) || /^f+$/.test(hash);
+    }
 
     /**
      * Get the effective source URL for an image (handles responsive images).
@@ -165,116 +200,116 @@
         return img.currentSrc || img.src;
     }
 
-    function isHashable(src) {
-        return src.startsWith('http://') || src.startsWith('https://');
-    }
+    // --- MEMORY ---
 
-    function isLargeEnough(img) {
-        return img.naturalWidth > MIN_WIDTH && img.naturalHeight > MIN_HEIGHT;
-    }
+    // src URL -> hash key
+    const processedSrcUrls = new Map();
 
-    // --- RENDERING ---
+    // hash key -> Set of src URLs that look like it
+    const hashToSrcUrls = new Map();
 
-    let renderTimer = null;
-
-    function scheduleRender() {
-        if (renderTimer !== null) return;
-        renderTimer = setTimeout(render, RENDER_INTERVAL);
-    }
+    // URLs that failed to hash (not retried)
+    const failedUrls = new Set();
 
     /**
-     * Outline every image whose URL is in a group of look-alikes on the page
-     * now, and clear every outline that no longer applies.
+     * Evicts the oldest entries from the caches when they exceed their limits.
      */
-    function render() {
-        renderTimer = null;
-        const { groups, sizeBySrc } = tracker.groups();
-        groupCount = groups.length;
-
-        const stale = new Set(decorations.keys());
-        for (const [img, src] of tracker.entries()) {
-            const size = sizeBySrc.get(src);
-            if (!size) continue;
-            markDuplicate(img, size);
-            stale.delete(img);
+    function evictOldestEntries() {
+        if (processedSrcUrls.size > MAX_CACHE_ENTRIES) {
+            let toRemove = processedSrcUrls.size - MAX_CACHE_ENTRIES;
+            for (const [src, hash] of processedSrcUrls) {
+                if (toRemove-- <= 0) break;
+                processedSrcUrls.delete(src);
+                const srcSet = hashToSrcUrls.get(hash);
+                if (srcSet) {
+                    srcSet.delete(src);
+                    if (srcSet.size === 0) hashToSrcUrls.delete(hash);
+                }
+            }
         }
-        for (const img of stale) clearDecoration(img);
-        reportStatus();
+
+        // Drop the oldest half of the failed URLs
+        if (failedUrls.size > MAX_FAILED_ENTRIES) {
+            let toRemove = Math.floor(failedUrls.size / 2);
+            for (const url of failedUrls) {
+                if (toRemove-- <= 0) break;
+                failedUrls.delete(url);
+            }
+        }
     }
 
-    // --- TOOLBAR BADGE ---
+    /**
+     * Mark every image on the page whose URL shares this hash key.
+     */
+    function updateAllMatchingImages(targetHash) {
+        const matchingSrcs = hashToSrcUrls.get(targetHash);
+        if (!matchingSrcs || matchingSrcs.size <= 1) return;
 
-    let statusTimer = null;
+        for (const pageImg of document.querySelectorAll('img')) {
+            if (matchingSrcs.has(getImageSrc(pageImg))) {
+                markDuplicate(pageImg, matchingSrcs.size);
+            }
+        }
+    }
 
     /**
-     * Tell the service worker how the scan is going, at most every 250ms.
-     * Throttled, not debounced: the badge keeps updating while hashes keep
-     * arriving, and each update reads the state when it is sent, so the last
-     * one sees the empty queue.
+     * Re-apply the highlight to an image whose URL is already hashed.
      */
-    function reportStatus() {
-        if (statusTimer !== null) return;
-        statusTimer = setTimeout(() => {
-            statusTimer = null;
-            chrome.runtime.sendMessage({
-                action: 'SCAN_STATUS',
-                pending: DuplicateImageHash.pendingCount(),
-                groups: groupCount
-            }, () => {
-                // The service worker may be restarting; the next update retries.
-                void chrome.runtime.lastError;
-            });
-        }, 250);
+    function remark(img, src) {
+        const srcSet = hashToSrcUrls.get(processedSrcUrls.get(src));
+        if (srcSet && srcSet.size > 1) markDuplicate(img, srcSet.size);
     }
 
     // --- PAGE PROCESSING ---
 
     /**
-     * Hash an image's URL unless it is already known or being hashed.
+     * Hash an image that came near the viewport and check it for duplicates.
      */
     function processImage(img) {
-        if (!img.isConnected) return; // removed while waiting to load
         const src = getImageSrc(img);
-        if (!tracker.needsHash(src)) return;
 
-        if (!isLargeEnough(img)) {
-            tracker.recordSkip(src);
+        if (processedSrcUrls.has(src)) {
+            remark(img, src);
             return;
         }
+        if (failedUrls.has(src)) return;
 
-        tracker.markPending(src);
-        DuplicateImageHash.queueHash(src).then((result) => {
-            if (result && result.dropped) {
-                tracker.cancelPending(src); // left the page before its turn
-            } else {
-                tracker.recordHash(src, result);
+        DuplicateImageHash.queueHash(src).then((hash) => {
+            if (!hash) {
+                failedUrls.add(src);
+                return;
             }
-            scheduleRender();
+            if (isSolidColor(hash)) return;
+
+            const targetKey = findMatchingHash(hash, hashToSrcUrls) || hash;
+            processedSrcUrls.set(src, targetKey);
+            if (!hashToSrcUrls.has(targetKey)) hashToSrcUrls.set(targetKey, new Set());
+            const matchingSrcs = hashToSrcUrls.get(targetKey);
+            matchingSrcs.add(src);
+
+            // Different URLs with the same look = duplicates
+            if (matchingSrcs.size > 1) {
+                console.log(`${LOG_PREFIX} Duplicate found:`, {
+                    hash: targetKey.substring(0, 16) + '...',
+                    count: matchingSrcs.size
+                });
+                updateAllMatchingImages(targetKey);
+            }
         });
-        reportStatus();
     }
 
     /**
-     * Process an image that reached the viewport. Lazy-loaded images may not
-     * have pixels yet; wait for them instead of skipping them for good.
+     * Big enough, and a real URL rather than inline data.
      */
-    function handleVisibleImage(img) {
-        if (!isHashable(getImageSrc(img))) return;
-
-        if (img.complete && img.naturalWidth > 0) {
-            processImage(img);
-            return;
-        }
-
-        if (awaitingLoad.has(img)) return;
-        awaitingLoad.add(img);
-        img.addEventListener('load', () => {
-            awaitingLoad.delete(img);
-            if (isHashable(getImageSrc(img))) processImage(img);
-        }, { once: true });
+    function isValidImage(img) {
+        if (!img.src || img.src.startsWith('data:')) return false;
+        return img.naturalWidth > 100 && img.naturalHeight > 50;
     }
 
     // --- VIEWPORT-BASED PROCESSING ---
+
+    // Images already handed to the IntersectionObserver
+    const observedImages = new WeakSet();
 
     /**
      * Hash images as they approach the viewport, starting 500px before they
@@ -283,9 +318,9 @@
     const imageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
             if (!entry.isIntersecting) continue;
-            imageObserver.unobserve(entry.target);
-            watching.delete(entry.target);
-            handleVisibleImage(entry.target);
+            const img = entry.target;
+            imageObserver.unobserve(img);
+            if (isValidImage(img)) processImage(img);
         }
     }, {
         rootMargin: '500px',
@@ -293,40 +328,25 @@
     });
 
     /**
-     * Record which image URLs are on the page now, watch images whose URL
-     * still needs hashing, and drop work for images that have gone.
+     * The observe pass: watch every image not yet watched, and re-apply the
+     * highlight to images whose URL is already known.
      */
-    function scanPage() {
-        const onPage = [];
-        const all = document.querySelectorAll('img');
-        const present = new Set(all);
-        for (const img of watching.keys()) {
-            if (present.has(img)) continue;
-            imageObserver.unobserve(img);
-            watching.delete(img);
-        }
-        for (const img of all) {
-            const src = getImageSrc(img);
-            if (!isHashable(src)) continue;
-            onPage.push([img, src]);
+    function observeNewImages() {
+        evictOldestEntries();
 
-            if (!tracker.needsHash(src)) continue;
-            if (watching.get(img) === src || awaitingLoad.has(img)) continue;
-            watching.set(img, src);
+        for (const img of document.querySelectorAll('img')) {
+            if (observedImages.has(img)) continue;
+
+            const src = getImageSrc(img);
+            if (processedSrcUrls.has(src)) {
+                remark(img, src);
+                continue;
+            }
+            if (failedUrls.has(src)) continue;
+
+            observedImages.add(img);
             imageObserver.observe(img);
         }
-        tracker.sync(onPage);
-        DuplicateImageHash.dropQueued((src) => !tracker.isLive(src));
-        scheduleRender();
-    }
-
-    /**
-     * Toolbar click on an active tab: retry failed images and look at every
-     * image again.
-     */
-    function rescan() {
-        tracker.retryFailed();
-        scanPage();
     }
 
     // --- KEYBOARD SHORTCUTS ---
@@ -334,50 +354,57 @@
     window.addEventListener('keydown', (e) => {
         if (!e.altKey || !e.shiftKey) return;
 
-        // Alt + Shift + D = debug dump to the console
+        // Alt + Shift + R = forget everything and reload
+        if (e.code === 'KeyR') {
+            console.log(`${LOG_PREFIX} Resetting...`);
+            processedSrcUrls.clear();
+            hashToSrcUrls.clear();
+            failedUrls.clear();
+            location.reload();
+        }
+
+        // Alt + Shift + D = debug dump
         if (e.code === 'KeyD') {
-            e.preventDefault();
-            console.log(`${LOG_PREFIX} Cache:`, tracker.stats());
-            console.table(tracker.groups().groups.map((srcs) => ({ count: srcs.size, urls: Array.from(srcs) })));
+            console.log(`${LOG_PREFIX} Debug dump`);
+            console.log('Processed URLs:', processedSrcUrls.size);
+            console.log('Unique hashes:', hashToSrcUrls.size);
+            console.log('Failed URLs:', failedUrls.size);
+
+            const duplicates = [];
+            for (const [hash, srcSet] of hashToSrcUrls) {
+                if (srcSet.size > 1) {
+                    duplicates.push({
+                        hash: hash.substring(0, 16) + '...',
+                        count: srcSet.size,
+                        urls: Array.from(srcSet).map(u => u.substring(0, 60) + '...')
+                    });
+                }
+            }
+            console.table(duplicates);
         }
 
-        // Alt + Shift + S = rescan now (same as clicking the toolbar button)
+        // Alt + Shift + S = rescan now
         if (e.code === 'KeyS') {
-            e.preventDefault();
-            rescan();
+            console.log(`${LOG_PREFIX} Manual rescan triggered`);
+            observeNewImages();
         }
     });
 
-    // --- PAGE CHANGES (infinite scroll, SPAs, lazy src swaps) ---
+    // --- PAGE CHANGES (infinite scroll, SPAs) ---
 
-    // Throttled, not debounced: a page that never stops changing still gets scanned.
-    let scanTimer = null;
-    function scheduleScan() {
-        if (scanTimer !== null) return;
-        scanTimer = setTimeout(() => {
-            scanTimer = null;
-            scanPage();
-        }, MUTATION_INTERVAL);
-    }
-
-    const domObserver = new MutationObserver(scheduleScan);
-
-    // An image can switch URL without any DOM change: a lazy or srcset image
-    // resolves currentSrc when it loads, and a resize can pick another srcset
-    // candidate. Each of those fires 'load' (which does not bubble, so capture).
-    document.addEventListener('load', (e) => {
-        if (e.target.tagName === 'IMG') scheduleScan();
-    }, true);
-
-    domObserver.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['src', 'srcset']
+    let debounceTimer = null;
+    const domObserver = new MutationObserver(() => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(observeNewImages, 500);
     });
+    domObserver.observe(document.body, { childList: true, subtree: true });
 
-    window.__duplicateImageHighlighter = { rescan };
+    window.__duplicateImageHighlighter = {
+        rescan: observeNewImages,
+        // Exposed for tests
+        markDuplicate
+    };
 
     console.log(`${LOG_PREFIX} Active on this tab.`);
-    scanPage();
+    setTimeout(observeNewImages, 500);
 })();

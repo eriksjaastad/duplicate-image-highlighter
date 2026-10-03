@@ -4,13 +4,12 @@
 
 First public release.
 
-- Highlights duplicate and near-duplicate `<img>` elements on the current page using a 32×32 difference hash and a Hamming-distance threshold of 5.
-- Runs only when you click the toolbar button, in the top frame of that tab.
-- Toolbar badge shows progress (`…`), then the number of duplicate groups.
-- Handles lazy-loaded images, infinite scroll and images whose `src` changes after load. Groups are recomputed from the images on the page, so removing or changing an image updates its group, its outline and the toolbar count.
-- Near-matches chain into one group (A like B, B like C), and the result does not depend on the order images are hashed in.
-- Single-color placeholders are skipped by measuring the image's pixels, so smooth gradients are still compared.
-- Duplicates are marked with an outline drawn inside the image's edge, colored by how many look-alike files there are. Outlines take no space, so the page layout never moves; the image's own inline outline styles (width, style, color, offset) are each restored when a highlight is cleared, unless the page has changed that property since.
-- Clicking again rescans and retries images that failed to load.
+- Marks `<img>` elements that look like other images on the current page, using a 32×32 difference hash and a Hamming-distance threshold of 5. Different URLs only: the same URL twice is not a duplicate.
+- A new hash joins the first stored hash within 5 bits, in the order hashes arrive.
+- Each duplicate gets a striped overlay and a count pill on its parent, colored blue for 2 copies through red for 10 or more, plus an outline on the image.
+- Skips images with no `src`, `data:` URLs, images 100×50 pixels or smaller, and flat placeholders.
+- Hashes images as they come within 500px of the viewport, at most 5 at a time, and picks up images added later (infinite scroll, single-page apps).
+- Runs only when you click the toolbar button, in the top frame of that tab. Clicking again rescans. Pages that refuse injection get a `×` badge.
+- Shortcuts: Alt+Shift+R resets and reloads, Alt+Shift+D logs a debug dump, Alt+Shift+S rescans.
 - Image fetches go through the service worker without cookies, accept only `http(s)` URLs and image (or unlabeled) content types, time out after 15 seconds, and skip images over 20 MB.
 - Each GitHub Release carries a zip of the extension, ready for **Load unpacked**.
