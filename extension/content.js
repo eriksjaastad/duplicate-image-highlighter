@@ -20,6 +20,16 @@
  * - DOM changes under document.body trigger the observe pass 500ms after
  *   they stop. The first pass runs 500ms after the click.
  * - A URL that failed to hash is not retried until Alt+Shift+R.
+ * - A URL is hashed once at a time: other images showing it while its hash
+ *   is in flight wait for that result instead of queueing it again.
+ * - An image removed from the page before it came near the viewport is no
+ *   longer watched.
+ *
+ * Limits, kept from the original:
+ * - An image that came near the viewport before its pixels decoded is never
+ *   watched again: there is no load listener, and a changed src is not hashed.
+ * - Counts never shrink: removing an image from the page leaves the count and
+ *   pill on the images that remain.
  *
  * What you see on each image whose look-alike group has N > 1 URLs:
  * - with t = (min(N, 10) - 1) / 9, hue = 200 - 200 * t (blue at 2, red at 10+)
@@ -28,6 +38,9 @@
  *   45deg stripes 20 - 15 * t pixels wide
  * - div.dih-count: a pill in the parent's top-right corner showing N
  * A parent with position static is made position relative to hold them.
+ * Only the parent's direct-child stripe and pill belong to its image; one that
+ * already shows N, on an image whose outline already matches, is left alone,
+ * so re-marking does not change the page and trigger another pass.
  *
  * Keyboard shortcuts:
  * - Alt+Shift+R: forget every hash and failure, and reload the page
@@ -103,37 +116,26 @@
     }
 
     /**
-     * Marks an image as one of `count` look-alikes: outline on the image,
-     * stripe overlay and count pill on its parent.
+     * The parent's direct child with this class (a nested image's decoration
+     * belongs to that image, not this one).
      */
-    function markDuplicate(img, count) {
-        const parent = img.parentElement;
-        if (!parent) return;
+    function decorationOf(parent, className) {
+        return parent.querySelector(`:scope > .${className}`);
+    }
 
-        // Remove the previous decoration
-        const existingCount = parent.querySelector('.dih-count');
-        if (existingCount) existingCount.remove();
-        const existingStripe = parent.querySelector('.dih-stripe');
-        if (existingStripe) existingStripe.remove();
+    /**
+     * Whether every listed inline style on `el` already reads back as `styles`
+     * would. The browser re-serializes what it is given (hsl becomes rgb), so
+     * both sides go through a scratch element first.
+     */
+    function hasStyles(el, styles) {
+        const probe = document.createElement('div');
+        Object.assign(probe.style, styles);
+        return Object.keys(styles).every((name) => el.style[name] === probe.style[name]);
+    }
 
-        if (count <= 1) {
-            img.style.outline = '';
-            return;
-        }
-
-        const styles = styleForCount(count);
-
-        img.style.outline = styles.outline;
-        img.style.outlineOffset = styles.outlineOffset;
-
-        // The overlay and pill are positioned against the parent
-        if (window.getComputedStyle(parent).position === 'static') {
-            parent.style.position = 'relative';
-        }
-
-        const stripe = document.createElement('div');
-        stripe.className = 'dih-stripe';
-        Object.assign(stripe.style, {
+    function stripeStyles(styles) {
+        return {
             position: 'absolute',
             top: '0',
             left: '0',
@@ -143,14 +145,11 @@
             pointerEvents: 'none',
             zIndex: String(styles.zIndex - 1),
             borderRadius: 'inherit'
-        });
-        parent.appendChild(stripe);
+        };
+    }
 
-        const pill = document.createElement('div');
-        pill.className = 'dih-count';
-        pill.textContent = String(count);
-        pill.setAttribute('title', `Duplicate: ${count} copies on this page`);
-        Object.assign(pill.style, {
+    function pillStyles(styles) {
+        return {
             position: 'absolute',
             top: '4px',
             right: '4px',
@@ -164,7 +163,62 @@
             zIndex: String(styles.zIndex),
             boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
             pointerEvents: 'none'
-        });
+        };
+    }
+
+    /**
+     * Marks an image as one of `count` look-alikes: outline on the image,
+     * stripe overlay and count pill on its parent. Leaves whatever already
+     * matches untouched, so a repeat call changes nothing.
+     */
+    function markDuplicate(img, count) {
+        const parent = img.parentElement;
+        if (!parent) return;
+
+        const existingStripe = decorationOf(parent, 'dih-stripe');
+        const existingCount = decorationOf(parent, 'dih-count');
+
+        if (count <= 1) {
+            if (existingCount) existingCount.remove();
+            if (existingStripe) existingStripe.remove();
+            img.style.outline = '';
+            return;
+        }
+
+        const styles = styleForCount(count);
+        const outline = { outline: styles.outline, outlineOffset: styles.outlineOffset };
+        if (!hasStyles(img, outline)) Object.assign(img.style, outline);
+
+        // The overlay and pill are positioned against the parent
+        if (window.getComputedStyle(parent).position === 'static') {
+            parent.style.position = 'relative';
+        }
+
+        const title = `Duplicate: ${count} copies on this page`;
+        const stripeStyle = stripeStyles(styles);
+        const pillStyle = pillStyles(styles);
+        if (existingStripe && existingCount &&
+            existingCount.textContent === String(count) &&
+            existingCount.getAttribute('title') === title &&
+            hasStyles(existingStripe, stripeStyle) &&
+            hasStyles(existingCount, pillStyle)) {
+            return;
+        }
+
+        // Replace the previous decoration
+        if (existingCount) existingCount.remove();
+        if (existingStripe) existingStripe.remove();
+
+        const stripe = document.createElement('div');
+        stripe.className = 'dih-stripe';
+        Object.assign(stripe.style, stripeStyle);
+        parent.appendChild(stripe);
+
+        const pill = document.createElement('div');
+        pill.className = 'dih-count';
+        pill.textContent = String(count);
+        pill.setAttribute('title', title);
+        Object.assign(pill.style, pillStyle);
         parent.appendChild(pill);
     }
 
@@ -210,6 +264,9 @@
 
     // URLs that failed to hash (not retried)
     const failedUrls = new Set();
+
+    // src URL -> its hash in flight; cleared when it finishes
+    const pendingHashes = new Map();
 
     /**
      * Evicts the oldest entries from the caches when they exceed their limits.
@@ -274,7 +331,15 @@
         }
         if (failedUrls.has(src)) return;
 
-        DuplicateImageHash.queueHash(src).then((hash) => {
+        // Another image with this URL is already being hashed: share its result
+        const pending = pendingHashes.get(src);
+        if (pending) {
+            pending.then(() => remark(img, src));
+            return;
+        }
+
+        pendingHashes.set(src, DuplicateImageHash.queueHash(src).then((hash) => {
+            pendingHashes.delete(src);
             if (!hash) {
                 failedUrls.add(src);
                 return;
@@ -295,7 +360,7 @@
                 });
                 updateAllMatchingImages(targetKey);
             }
-        });
+        }));
     }
 
     /**
@@ -311,6 +376,9 @@
     // Images already handed to the IntersectionObserver
     const observedImages = new WeakSet();
 
+    // The subset still waiting to come near the viewport
+    const watchingImages = new Set();
+
     /**
      * Hash images as they approach the viewport, starting 500px before they
      * become visible.
@@ -320,6 +388,7 @@
             if (!entry.isIntersecting) continue;
             const img = entry.target;
             imageObserver.unobserve(img);
+            watchingImages.delete(img);
             if (isValidImage(img)) processImage(img);
         }
     }, {
@@ -328,11 +397,19 @@
     });
 
     /**
-     * The observe pass: watch every image not yet watched, and re-apply the
+     * The observe pass: stop watching images that left the page before they
+     * came into view, watch every image not yet watched, and re-apply the
      * highlight to images whose URL is already known.
      */
     function observeNewImages() {
         evictOldestEntries();
+
+        for (const img of watchingImages) {
+            if (img.isConnected) continue;
+            imageObserver.unobserve(img);
+            watchingImages.delete(img);
+            observedImages.delete(img);
+        }
 
         for (const img of document.querySelectorAll('img')) {
             if (observedImages.has(img)) continue;
@@ -345,6 +422,7 @@
             if (failedUrls.has(src)) continue;
 
             observedImages.add(img);
+            watchingImages.add(img);
             imageObserver.observe(img);
         }
     }

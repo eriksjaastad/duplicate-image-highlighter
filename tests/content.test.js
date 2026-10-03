@@ -2,6 +2,10 @@
 // content.js against a minimal fake DOM: enough to drive observing, matching,
 // the stripe and pill, and the shortcuts without a browser. Hashing is stubbed
 // with fixed hashes per URL; hammingDistance is the real one from hash.js.
+// Options: `serialize` rewrites every inline style value on write, the way a
+// browser re-serializes colors; `deferred` holds each hash until
+// page.resolveHash(src); `liveMutations` fires the MutationObserver callback on
+// every child added to or removed from the page.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -40,23 +44,33 @@ class FakeElement {
         this.page = page;
         this.children = [];
         this.parentElement = null;
-        this.style = {};
+        this.style = page.serialize
+            ? new Proxy({}, { set: (target, name, value) => { target[name] = page.serialize(value); return true; } })
+            : {};
         this.className = '';
         this.attributes = {};
         this.textContent = '';
         this.computedPosition = 'static'; // what the page's stylesheets say
     }
+    get isConnected() {
+        let el = this;
+        while (el.parentElement) el = el.parentElement;
+        return el === this.page.body;
+    }
     appendChild(child) {
         if (child.parentElement) child.remove();
         child.parentElement = this;
         this.children.push(child);
+        if (this.isConnected) this.page.childListChanged();
         return child;
     }
     remove() {
         if (!this.parentElement) return;
+        const connected = this.parentElement.isConnected;
         const siblings = this.parentElement.children;
         siblings.splice(siblings.indexOf(this), 1);
         this.parentElement = null;
+        if (connected) this.page.childListChanged();
     }
     setAttribute(name, value) { this.attributes[name] = String(value); }
     getAttribute(name) { return this.attributes[name] ?? null; }
@@ -66,9 +80,12 @@ class FakeElement {
             yield* child.descendants();
         }
     }
+    // '.class' searches descendants; ':scope > .class' only direct children.
     querySelector(selector) {
-        const cls = selector.slice(1); // only '.class' is used
-        for (const el of this.descendants()) if (el.className.split(' ').includes(cls)) return el;
+        const direct = selector.match(/^:scope > \.([\w-]+)$/);
+        const cls = direct ? direct[1] : selector.match(/^\.([\w-]+)$/)[1];
+        const candidates = direct ? this.children : this.descendants();
+        for (const el of candidates) if (el.className.split(' ').includes(cls)) return el;
         return null;
     }
     byClass(cls) { return this.children.filter((el) => el.className === cls); }
@@ -85,10 +102,22 @@ class FakeImg extends FakeElement {
 }
 
 // Loads content.js into a fake page. `hashes` maps URL -> hash (missing = failed).
-function loadPage(hashes = {}) {
+function loadPage(hashes = {}, { serialize = null, deferred = false, liveMutations = false } = {}) {
     const page = {
         timers: new Map(), nextTimer: 1, observed: new Set(), observeCalls: [], hashed: [],
-        keyListeners: [], logs: [], tables: [], reloads: 0, constructed: { intersection: 0, mutation: 0 }
+        keyListeners: [], logs: [], tables: [], reloads: 0, constructed: { intersection: 0, mutation: 0 },
+        serialize, childListChanges: 0, waiting: new Map()
+    };
+    page.childListChanged = () => {
+        page.childListChanges++;
+        if (liveMutations && page.mutate) page.mutate();
+    };
+    // Release a deferred hash and let its result settle.
+    page.resolveHash = async (src) => {
+        const resolvers = page.waiting.get(src);
+        page.waiting.delete(src);
+        for (const resolve of resolvers) resolve(src in hashes ? hashes[src] : null);
+        await new Promise((r) => setImmediate(r));
     };
     const body = new FakeElement('body', page);
     page.body = body;
@@ -139,7 +168,11 @@ function loadPage(hashes = {}) {
         hammingDistance,
         queueHash: (src) => {
             page.hashed.push(src);
-            return Promise.resolve(src in hashes ? hashes[src] : null);
+            if (!deferred) return Promise.resolve(src in hashes ? hashes[src] : null);
+            return new Promise((resolve) => {
+                if (!page.waiting.has(src)) page.waiting.set(src, []);
+                page.waiting.get(src).push(resolve);
+            });
         }
     };
     page.inject = () => vm.runInContext(read('content.js'), context);
@@ -305,6 +338,12 @@ test('re-marking replaces the stripe and pill; a count of 1 clears them and the 
     assert.equal(stripeOf(img).length, 1);
     assert.equal(pillOf(img).length, 1);
     assertMarked(img, 3);
+
+    const [stripe] = stripeOf(img);
+    const [pill] = pillOf(img);
+    markDuplicate(img, 3);
+    assert.equal(stripeOf(img)[0], stripe, 'same count keeps the stripe');
+    assert.equal(pillOf(img)[0], pill, 'same count keeps the pill');
 
     markDuplicate(img, 1);
     assert.equal(stripeOf(img).length, 0);
@@ -481,4 +520,185 @@ test('a second injection rescans once and adds no observer or shortcut listener'
 
     page.inject();
     assert.deepEqual(page.observeCalls, [img], 'an image already observed is not observed twice');
+});
+
+test('re-marking with the same count leaves the page alone, so the scan settles', async () => {
+    // A browser reads inline styles back re-serialized; the fake drops the space after commas.
+    const page = loadPage(
+        { 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE },
+        { serialize: (value) => String(value).replace(/, /g, ','), liveMutations: true }
+    );
+    page.addImage('https://x.example/a.jpg');
+    page.addImage('https://x.example/b.jpg');
+    await page.settle();
+
+    // Known URL, never observed: every pass remarks it.
+    const late = page.addImage('https://x.example/b.jpg');
+    page.runTimers();
+    assert.equal(pillOf(late)[0].textContent, '2');
+    assert.equal(late.style.outline, '3px solid hsl(177.77777777777777,100%,50%)');
+    const [stripe] = stripeOf(late);
+    const [pill] = pillOf(late);
+
+    // The pass that marked it changed the page, so one more pass is due; that one changes nothing.
+    assert.equal(page.timers.size, 1);
+    const changes = page.childListChanges;
+    page.runTimers();
+    assert.equal(page.childListChanges, changes, 'no stripe or pill removed or added');
+    assert.equal(page.timers.size, 0, 'no further pass scheduled');
+    assert.equal(stripeOf(late)[0], stripe);
+    assert.equal(pillOf(late)[0], pill);
+
+    page.press('KeyS');
+    assert.equal(page.childListChanges, changes);
+    assert.equal(page.timers.size, 0);
+});
+
+test('a page that rewrote the outline or pill gets it back, without touching what still matches', () => {
+    const page = loadPage();
+    const img = page.addImage('https://x.example/a.jpg');
+    const { markDuplicate } = page.window.__duplicateImageHighlighter;
+    markDuplicate(img, 2);
+    const [stripe] = stripeOf(img);
+    const [pill] = pillOf(img);
+
+    img.style.outline = 'none';
+    const changes = page.childListChanges;
+    markDuplicate(img, 2);
+    assertMarked(img, 2);
+    assert.equal(page.childListChanges, changes, 'only the outline was rewritten');
+    assert.equal(stripeOf(img)[0], stripe);
+
+    pill.style.zIndex = '1';
+    markDuplicate(img, 2);
+    assertMarked(img, 2);
+    assert.notEqual(pillOf(img)[0], pill, 'a changed pill is replaced');
+});
+
+test('only the direct-child stripe and pill belong to an image; a nested image keeps its own', () => {
+    const page = loadPage();
+    const { markDuplicate } = page.window.__duplicateImageHighlighter;
+    const outer = page.addImage('https://x.example/outer.jpg');
+    const innerWrapper = outer.parentElement.appendChild(new FakeElement('div', page));
+    const inner = innerWrapper.appendChild(new FakeImg(page, 'https://x.example/inner.jpg'));
+
+    // The nested decoration showing the same count is not taken as the outer image's.
+    markDuplicate(inner, 3);
+    markDuplicate(outer, 3);
+    assertMarked(inner, 3);
+    assertMarked(outer, 3);
+    const [innerStripe] = stripeOf(inner);
+    const [innerPill] = pillOf(inner);
+
+    markDuplicate(outer, 4);
+    assertMarked(outer, 4);
+    markDuplicate(outer, 1);
+    assert.deepEqual(outer.parentElement.children, [outer, innerWrapper]);
+    assertMarked(inner, 3);
+    assert.equal(stripeOf(inner)[0], innerStripe);
+    assert.equal(pillOf(inner)[0], innerPill);
+});
+
+test('a URL whose hash is in flight is not queued again; its other images share the result', async () => {
+    const urls = { a: 'https://x.example/a.jpg', b: 'https://x.example/b.jpg' };
+    const page = loadPage({ [urls.a]: BASE, [urls.b]: BASE }, { deferred: true });
+    const a1 = page.addImage(urls.a);
+    const a2 = page.addImage(urls.a);
+    const b = page.addImage(urls.b);
+    page.runTimers();
+
+    await page.scroll([a1]);
+    await page.scroll([a2, b]);
+    assert.deepEqual(page.hashed, [urls.a, urls.b]);
+
+    await page.resolveHash(urls.b);
+    await page.resolveHash(urls.a);
+    for (const img of [a1, a2, b]) assertMarked(img, 2);
+    assert.deepEqual(page.hashed, [urls.a, urls.b], 'each URL hashed once');
+});
+
+test('the in-flight mark clears when the hash finishes', async () => {
+    // A flat hash is not stored, so a later image with that URL is hashed again
+    // unless a stale in-flight mark holds it back.
+    const flat = 'https://x.example/flat.jpg';
+    const page = loadPage({ [flat]: HASH_LOW }, { deferred: true });
+    const first = page.addImage(flat);
+    const second = page.addImage(flat);
+    page.runTimers();
+    await page.scroll([first, second]);
+    assert.deepEqual(page.hashed, [flat]);
+    await page.resolveHash(flat);
+
+    const later = page.addImage(flat);
+    page.mutate();
+    page.runTimers();
+    await page.scroll([later]);
+    assert.deepEqual(page.hashed, [flat, flat]);
+});
+
+test('an image removed before it came into view is no longer watched; one still on the page is', () => {
+    const page = loadPage();
+    page.runTimers();
+    const gone = page.addImage('https://x.example/gone.jpg');
+    const kept = page.addImage('https://x.example/kept.jpg');
+    page.mutate();
+    page.runTimers();
+    assert.deepEqual([...page.observed], [gone, kept]);
+
+    const wrapper = gone.parentElement;
+    wrapper.remove();
+    page.mutate();
+    page.runTimers();
+    assert.deepEqual([...page.observed], [kept]);
+
+    // Dropped from the observed set, so it is watched again if it comes back.
+    page.body.appendChild(wrapper);
+    page.mutate();
+    page.runTimers();
+    assert.deepEqual([...page.observed], [kept, gone]);
+    assert.deepEqual(page.observeCalls, [gone, kept, gone], 'kept observed only once');
+});
+
+test('limit: an image that came into view before it decoded is not watched again', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
+    const img = page.addImage('https://x.example/a.jpg', { width: 0, height: 0 });
+    page.runTimers();
+    await page.scroll();
+    assert.deepEqual(page.hashed, []);
+
+    img.naturalWidth = 400;
+    img.naturalHeight = 300;
+    page.press('KeyS');
+    page.mutate();
+    page.runTimers();
+    page.inject();
+    assert.deepEqual(page.observeCalls, [img], 'not observed again');
+    assert.equal(page.observed.size, 0);
+    assert.deepEqual(page.hashed, []);
+
+    // Nor is an image whose src changed after it was hashed.
+    const changed = page.addImage('https://x.example/b.jpg');
+    page.press('KeyS');
+    await page.scroll([changed]);
+    changed.src = changed.currentSrc = 'https://x.example/c.jpg';
+    page.press('KeyS');
+    assert.equal(page.observed.has(changed), false);
+    assert.deepEqual(page.hashed, ['https://x.example/b.jpg']);
+});
+
+test('limit: removing one of two matching images leaves the survivor\'s count and pill', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
+    const a = page.addImage('https://x.example/a.jpg');
+    const b = page.addImage('https://x.example/b.jpg');
+    await page.settle();
+    const [pill] = pillOf(a);
+    const [stripe] = stripeOf(a);
+
+    b.parentElement.remove();
+    page.mutate();
+    page.runTimers();
+    page.press('KeyS');
+    assertMarked(a, 2);
+    assert.equal(pillOf(a)[0], pill);
+    assert.equal(stripeOf(a)[0], stripe);
 });

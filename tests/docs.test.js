@@ -10,6 +10,8 @@ const { spawnSync } = require('node:child_process');
 const ROOT = path.join(__dirname, '..');
 const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 
+const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // The leading /** ... */ block of extension/content.js, as one line of words.
 function contentHeader() {
     const source = read('extension/content.js');
@@ -35,7 +37,14 @@ test('content.js header states the behavior spec', () => {
         'stripe width': /20 - 15 \* t pixels/,
         'reset shortcut': /Alt\+Shift\+R: forget every hash and failure, and reload/,
         'debug shortcut': /Alt\+Shift\+D: log a debug dump/,
-        'rescan shortcut': /Alt\+Shift\+S: run the observe pass again/
+        'rescan shortcut': /Alt\+Shift\+S: run the observe pass again/,
+        'one hash per URL in flight': /A URL is hashed once at a time/,
+        'removed before view unwatched': /An image removed from the page before it came near the viewport is no longer watched\./,
+        'idempotent decoration': /Only the parent's direct-child stripe and pill belong to its image/,
+        'limit: watched once': new RegExp(escape('An image that came near the viewport before its pixels decoded ' +
+            'is never watched again: there is no load listener, and a changed src is not hashed.')),
+        'limit: counts never shrink': new RegExp(escape('Counts never shrink: removing an image from the page ' +
+            'leaves the count and pill on the images that remain.'))
     };
     for (const [fact, pattern] of Object.entries(facts)) {
         assert.match(header, pattern, `header lost: ${fact}`);
