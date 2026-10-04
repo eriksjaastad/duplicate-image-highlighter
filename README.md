@@ -4,6 +4,10 @@ A Chrome extension that marks images on a web page that look like other images o
 
 It compares what images look like, not their URLs: two different files of the same picture (resized, re-encoded) are duplicates.
 
+![Four copies of one picture with a stripe and a count of 4](docs/images/dih-readme.png)
+
+Four copies of the same picture get a stripe and a count of 4. A different picture stays unmarked.
+
 What it is not:
 
 - **Not automatic.** Nothing runs on a page until you click the toolbar button, and only in that tab's top frame.

@@ -81,10 +81,13 @@ test('README carries the copyright line and links the license', () => {
     assert.match(read('LICENSE'), /Copyright \(c\) 2026 Erik Sjaastad/);
 });
 
-test('README points at the content.js header and shows no screenshot', () => {
+test('README points at the content.js header and shows the stripe overlay image', () => {
     const readme = read('README.md');
     assert.match(readme, /extension\/content\.js/);
-    assert.doesNotMatch(readme, /!\[|screenshot/i);
+    assert.match(readme, /!\[[^\]]+\]\(docs\/images\/dih-readme\.png\)/);
+    assert.ok(readme.split('\n').includes('Four copies of the same picture get a stripe and a count of 4. ' +
+        'A different picture stays unmarked.'), 'README lost the image caption');
+    assert.ok(fs.statSync(path.join(ROOT, 'docs/images/dih-readme.png')).size > 0);
 });
 
 test('nothing tracked mentions the removed groups module', () => {
