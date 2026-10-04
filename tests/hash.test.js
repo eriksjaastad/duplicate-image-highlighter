@@ -78,18 +78,35 @@ test('binToHex pads a short final chunk on the right', () => {
     assert.equal(hasher.binToHex('11110001'), 'f1');
 });
 
-test('hammingDistance counts differing bits', () => {
-    assert.equal(hasher.hammingDistance('00', '00'), 0);
-    assert.equal(hasher.hammingDistance('0f', '00'), 4);
-    assert.equal(hasher.hammingDistance('ff', '00'), 8);
+test('each bit compares a pixel with its right neighbour, row by row, 31 bits per row', () => {
+    // Pixel (0, 0) brighter than (1, 0): bit 0 is the top bit of hex digit 0.
+    assert.equal(hasher.dHashFromPixels(pixels((x, y) => (x === 0 && y === 0 ? 255 : 0)), SIZE), '8' + '0'.repeat(247));
+    // Pixel (0, 1): bit 31 is the bottom bit of hex digit 7.
+    assert.equal(hasher.dHashFromPixels(pixels((x, y) => (x === 0 && y === 1 ? 255 : 0)), SIZE), '0'.repeat(7) + '1' + '0'.repeat(240));
+    // Pixel (31, 0) has no right neighbour; it only makes bit 30 (left 0 < right 255) a 0.
+    assert.equal(hasher.dHashFromPixels(pixels((x, y) => (x === 31 && y === 0 ? 255 : 0)), SIZE), '0'.repeat(248));
 });
 
-test('hammingDistance with a limit stops early but still exceeds the limit', () => {
-    const a = 'f'.repeat(248);
-    const b = '0'.repeat(248);
-    const d = hasher.hammingDistance(a, b, 5);
-    assert.ok(d > 5 && d < 992, `distance ${d}`);
-    assert.equal(hasher.hammingDistance('0f', '00', 5), 4); // within limit: exact
+test('a bit is 1 only when the left RGB average is strictly greater', () => {
+    // Bit 0 (top bit of hex digit 0) for [r, g, b] at pixels (0, 0) and (1, 0).
+    function bit0(left, right) {
+        const data = pixels(() => 0);
+        data.set(left, 0);
+        data.set(right, 4);
+        return parseInt(hasher.dHashFromPixels(data, SIZE)[0], 16) >> 3;
+    }
+    assert.equal(bit0([90, 0, 0], [0, 0, 89]), 1); // 30 > 29.67
+    assert.equal(bit0([90, 0, 0], [0, 0, 90]), 0); // equal averages
+    assert.equal(bit0([0, 30, 0], [10, 10, 10]), 0); // 10 vs 10
+    assert.equal(bit0([0, 0, 1], [0, 0, 0]), 1); // 0.33 > 0
+});
+
+test('hammingDistance is the popcount of the XOR of each hex digit', () => {
+    assert.equal(hasher.hammingDistance('00', '00'), 0);
+    assert.equal(hasher.hammingDistance('8', '1'), 2);
+    assert.equal(hasher.hammingDistance('a5', '5a'), 8);
+    assert.equal(hasher.hammingDistance('0f', '00'), 4);
+    assert.equal(hasher.hammingDistance('ff', '00'), 8);
 });
 
 test('hammingDistance refuses to compare missing or mismatched hashes', () => {
@@ -104,70 +121,6 @@ test('re-injecting the module keeps the first instance', () => {
     const window = { DuplicateImageHash: first };
     vm.runInNewContext(source, { window, document: {}, chrome: {} });
     assert.equal(window.DuplicateImageHash, first);
-});
-
-test('a flat color is solid, with or without re-encoding noise', () => {
-    assert.equal(hasher.isSolidFromPixels(pixels(() => 128)), true);
-    assert.equal(hasher.isSolidFromPixels(pixels((x, y) => 128 + ((x + y) % 3) - 1)), true);
-});
-
-test('a smooth gradient is not solid, though it hashes to all zero bits', () => {
-    const gradient = pixels((x) => x * 8);
-    assert.match(hasher.dHashFromPixels(gradient, SIZE), /^0+$/);
-    assert.equal(hasher.isSolidFromPixels(gradient), false);
-});
-
-test('a pattern is not solid', () => {
-    assert.equal(hasher.isSolidFromPixels(pixels((x, y) => ((x * 7 + y * 13) % 50) + 100)), false);
-});
-
-// Checkerboard of two colors given as [r, g, b].
-function checkerboard(first, second) {
-    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
-    for (let y = 0; y < SIZE; y++) {
-        for (let x = 0; x < SIZE; x++) {
-            const i = (y * SIZE + x) * 4;
-            const [r, g, b] = (x + y) % 2 === 0 ? first : second;
-            data[i] = r;
-            data[i + 1] = g;
-            data[i + 2] = b;
-            data[i + 3] = 255;
-        }
-    }
-    return data;
-}
-
-test('a pattern of equally bright colors is not solid, whichever channels vary', () => {
-    assert.equal(hasher.isSolidFromPixels(checkerboard([200, 0, 0], [0, 200, 0])), false);
-    assert.equal(hasher.isSolidFromPixels(checkerboard([100, 200, 0], [100, 0, 200])), false);
-    assert.equal(hasher.isSolidFromPixels(checkerboard([100, 100, 0], [100, 100, 200])), false); // blue only
-    assert.equal(hasher.isSolidFromPixels(checkerboard([200, 100, 0], [200, 100, 0])), true);
-});
-
-test('dropQueued removes waiting hashes, not ones in flight', async () => {
-    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
-    const window = {};
-    vm.runInNewContext(source, {
-        window,
-        document: { createElement: () => ({ getContext: () => ({}) }) },
-        chrome: { runtime: { sendMessage: () => {} } } // fetches never answer: 5 stay in flight
-    });
-    const h = window.DuplicateImageHash;
-    const results = {};
-    for (let i = 0; i < 8; i++) h.queueHash(`u${i}`).then((r) => { results[`u${i}`] = r; });
-    assert.equal(h.pendingCount(), 8);
-
-    h.dropQueued((url) => url === 'u0' || url === 'u6' || url === 'u7');
-    await new Promise((r) => setImmediate(r));
-    assert.equal(h.pendingCount(), 6);
-    assert.deepEqual(Object.keys(results).sort(), ['u6', 'u7']);
-    assert.equal(results.u6.dropped, true);
-});
-
-test('a pattern made only by transparency is not solid', () => {
-    const data = new Uint8ClampedArray(SIZE * SIZE * 4); // all black
-    for (let i = 0; i < SIZE * SIZE; i++) data[i * 4 + 3] = (i % SIZE) < SIZE / 2 ? 255 : 0;
-    assert.equal(hasher.isSolidFromPixels(data), false);
 });
 
 // hash.js with a recording fake canvas; `extra` adds globals (createImageBitmap, Image, ...).
@@ -201,15 +154,54 @@ class FakeImage {
 }
 FakeImage.made = 0;
 
-test('images are drawn over white before their pixels are read', async () => {
+test('images are drawn on a cleared canvas with no white fill or other matte', async () => {
     let closed = false;
     const { hasher, calls } = loadWithCanvas({
         createImageBitmap: async () => ({ kind: 'bitmap', close: () => { closed = true; } })
     });
-    const result = await hasher.queueHash('https://x.example/a.png');
-    assert.equal(result.hash.length, 248);
-    assert.deepEqual(calls, [['fillStyle', '#fff'], ['fillRect', 0, 0, SIZE, SIZE], ['drawImage', 'bitmap']]);
+    const hash = await hasher.queueHash('https://x.example/a.png');
+    assert.equal(typeof hash, 'string');
+    assert.equal(hash.length, 248);
+    assert.deepEqual(calls, [['clearRect', 0, 0, SIZE, SIZE], ['drawImage', 'bitmap']]);
     assert.equal(closed, true, 'bitmap released');
+});
+
+test('the bitmap path and the Image path draw the same way, so they hash the same', async () => {
+    const bitmap = loadWithCanvas({ createImageBitmap: async () => ({ kind: 'bitmap', close() {} }) });
+    const image = loadWithCanvas({
+        Image: FakeImage,
+        createImageBitmap: async () => { throw new Error('The source image could not be decoded.'); }
+    });
+    const a = await bitmap.hasher.queueHash('https://x.example/a.png');
+    const b = await image.hasher.queueHash('https://x.example/a.png');
+    assert.equal(a, b);
+    const ops = (calls) => calls.map(([op, ...args]) => [op, ...(op === 'drawImage' ? [] : args)]);
+    assert.deepEqual(ops(bitmap.calls), ops(image.calls));
+});
+
+test('at most 5 hashes run at once; the rest wait in the queue', async () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
+    const window = {};
+    const requested = [];
+    vm.runInNewContext(source, {
+        window,
+        document: { createElement: () => ({ getContext: () => ({}) }) },
+        chrome: { runtime: { sendMessage: (msg) => requested.push(msg.url) } } // never answers
+    });
+    for (let i = 0; i < 8; i++) window.DuplicateImageHash.queueHash(`https://x.example/${i}.png`);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(requested, [0, 1, 2, 3, 4].map((i) => `https://x.example/${i}.png`));
+});
+
+test('a failed fetch resolves to null', async () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
+    const window = {};
+    vm.runInNewContext(source, {
+        window,
+        document: { createElement: () => ({ getContext: () => ({}) }) },
+        chrome: { runtime: { sendMessage: (msg, cb) => cb({ success: false, error: 'HTTP 404' }) } }
+    });
+    assert.equal(await window.DuplicateImageHash.queueHash('https://x.example/gone.png'), null);
 });
 
 test('raster images decode from a Blob, never through a data URL in the page', async () => {
@@ -231,8 +223,8 @@ test('formats createImageBitmap cannot decode fall back to the data URL', async 
         Image: FakeImage,
         createImageBitmap: async () => { throw new Error('The source image could not be decoded.'); }
     });
-    const result = await hasher.queueHash('https://x.example/a.svg');
-    assert.equal(result.hash.length, 248);
+    const hash = await hasher.queueHash('https://x.example/a.svg');
+    assert.equal(hash.length, 248);
     assert.equal(FakeImage.made, 1);
     assert.deepEqual(calls.at(-1), ['drawImage', 'Image']);
 });
@@ -274,8 +266,8 @@ test('a data URL that is not valid base64 falls back to the Image decoder', asyn
         createImageBitmap: async () => { bitmapCalls++; return { kind: 'bitmap', close() {} }; },
         dataUrl: 'data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg"/>'
     });
-    const result = await hasher.queueHash('https://x.example/a.svg');
-    assert.equal(result.hash.length, 248);
+    const hash = await hasher.queueHash('https://x.example/a.svg');
+    assert.equal(hash.length, 248);
     assert.equal(bitmapCalls, 0, 'atob rejected the payload before createImageBitmap ran');
     assert.equal(FakeImage.made, 1);
     assert.deepEqual(calls.at(-1), ['drawImage', 'Image']);

@@ -1,13 +1,16 @@
 /**
  * Service worker.
  *
- * 1. Toolbar click: injects the hasher, grouper and scanner into the clicked tab's top frame.
- *    Nothing runs on a page until you click. Clicking again rescans.
+ * 1. Toolbar click: injects the hasher and the page script into the clicked
+ *    tab's top frame. Nothing runs on a page until you click. Clicking again
+ *    rescans.
  * 2. Image fetch: content scripts cannot read pixels from cross-origin images
  *    (the canvas is tainted), so they ask the service worker to fetch the
  *    image and hand it back as a data URL.
- * 3. Toolbar badge: shows "…" while hashing, then the number of duplicate
- *    groups found on the page.
+ *
+ * Why the fetch is hardened (no cookies, http(s) only, image types, 15s,
+ * 20MB): a public extension that runs on any page you click cannot use an
+ * unbounded fetch that carries your cookies to whatever URL the page names.
  */
 
 const IMAGE_FETCH_MAX_BYTES = 20 * 1024 * 1024;
@@ -18,7 +21,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     try {
         await chrome.scripting.executeScript({
             target: { tabId: tab.id },
-            files: ['hash.js', 'groups.js', 'content.js']
+            files: ['hash.js', 'content.js']
         });
     } catch (error) {
         // Browser-internal pages (chrome://, the Web Store, PDFs) refuse injection.
@@ -28,7 +31,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     }
 });
 
-// A navigation discards the injected script, so its badge would be stale.
+// A new page in the tab may accept injection, so clear a stale ×.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.status === 'loading') {
         chrome.action.setBadgeText({ tabId, text: '' });
@@ -38,17 +41,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Only accept messages from our own content script running in a tab.
     if (sender.id !== chrome.runtime.id || !sender.tab) return false;
-
-    if (request.action === 'SCAN_STATUS') {
-        const tabId = sender.tab.id;
-        const busy = request.pending > 0;
-        chrome.action.setBadgeBackgroundColor({
-            tabId,
-            color: busy ? '#777' : (request.groups > 0 ? '#c62828' : '#2e7d32')
-        });
-        chrome.action.setBadgeText({ tabId, text: busy ? '…' : String(request.groups) });
-        return false;
-    }
 
     if (request.action === 'FETCH_IMAGE_BLOB') {
         fetchImageAsDataUrl(request.url)

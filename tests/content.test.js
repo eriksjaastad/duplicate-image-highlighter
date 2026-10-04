@@ -1,6 +1,12 @@
 // Run with: node --test tests/*.test.js
-// content.js against a minimal fake DOM: enough to drive scanning, grouping
-// and outlines without a browser. Hashing is stubbed with fixed hashes.
+// content.js against a minimal fake DOM: enough to drive observing, matching,
+// the stripe and pill, and the shortcuts without a browser. Hashing is stubbed
+// with fixed hashes per URL; hammingDistance is the real one from hash.js.
+// Options: `serialize` rewrites every inline style value on write, the way a
+// browser re-serializes colors; `deferred` holds each hash until
+// page.resolveHash(src); `liveMutations` fires the MutationObserver callback on
+// every child added to or removed from the page, with a record naming that child.
+// page.mutate() with no records stands for an unrelated page change.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -13,433 +19,748 @@ const read = (file) => fs.readFileSync(path.join(EXTENSION, file), 'utf8');
 const HASH_LENGTH = 248;
 const HASH_LOW = '0'.repeat(HASH_LENGTH);
 const HASH_HIGH = 'f'.repeat(HASH_LENGTH);
-const HASH_MID = '5'.repeat(HASH_LENGTH);
 
-// Inline style with the CSSOM's shorthand rules for `outline`: setting it sets
-// its three longhands, and it reads back only when all three are set with the
-// same priority.
-const OUTLINE_LONGHANDS = ['outline-width', 'outline-style', 'outline-color'];
+// A hash of 'a' digits with `flips` digits turned to 'b' (one bit each), starting at `from`.
+function hashWithFlips(from, flips) {
+    const digits = 'a'.repeat(HASH_LENGTH).split('');
+    for (let i = from; i < from + flips; i++) digits[i] = 'b';
+    return digits.join('');
+}
+const BASE = hashWithFlips(0, 0);
 
-class FakeStyle {
-    constructor() { this.props = new Map(); }
-    setProperty(prop, value, priority = '') {
-        if (prop !== 'outline') {
-            this.props.set(prop, { value, priority });
-            return;
+function realHammingDistance() {
+    const window = {};
+    vm.runInNewContext(read('hash.js'), {
+        window,
+        document: { createElement: () => ({ getContext: () => ({}) }) },
+        chrome: {}
+    });
+    return window.DuplicateImageHash.hammingDistance;
+}
+const hammingDistance = realHammingDistance();
+
+class FakeElement {
+    constructor(tagName, page) {
+        this.tagName = tagName.toUpperCase();
+        this.page = page;
+        this.children = [];
+        this.parentElement = null;
+        this.style = page.serialize
+            ? new Proxy({}, { set: (target, name, value) => { target[name] = page.serialize(value); return true; } })
+            : {};
+        this.className = '';
+        this.attributes = {};
+        this.textContent = '';
+        this.computedPosition = 'static'; // what the page's stylesheets say
+    }
+    get classList() {
+        return { contains: (cls) => this.className.split(' ').includes(cls) };
+    }
+    get isConnected() {
+        let el = this;
+        while (el.parentElement) el = el.parentElement;
+        return el === this.page.body;
+    }
+    appendChild(child) {
+        if (child.parentElement) child.remove();
+        child.parentElement = this;
+        this.children.push(child);
+        if (this.isConnected) this.page.childListChanged({ addedNodes: [child], removedNodes: [] });
+        return child;
+    }
+    remove() {
+        if (!this.parentElement) return;
+        const connected = this.parentElement.isConnected;
+        const record = { addedNodes: [], removedNodes: [this] };
+        const siblings = this.parentElement.children;
+        siblings.splice(siblings.indexOf(this), 1);
+        this.parentElement = null;
+        if (connected) this.page.childListChanged(record);
+    }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] ?? null; }
+    *descendants() {
+        for (const child of this.children) {
+            yield child;
+            yield* child.descendants();
         }
-        const [, width, style, color] = value.match(/^(\S+)\s+(\S+)\s+(.+)$/);
-        [width, style, color].forEach((v, i) => this.props.set(OUTLINE_LONGHANDS[i], { value: v, priority }));
     }
-    getPropertyValue(prop) {
-        if (prop !== 'outline') return this.props.get(prop)?.value ?? '';
-        const parts = OUTLINE_LONGHANDS.map((p) => this.props.get(p));
-        if (parts.some((p) => !p) || new Set(parts.map((p) => p.priority)).size > 1) return '';
-        return parts.map((p) => p.value).join(' ');
+    // '.class' searches descendants; ':scope > .class' only direct children.
+    querySelector(selector) {
+        const direct = selector.match(/^:scope > \.([\w-]+)$/);
+        const cls = direct ? direct[1] : selector.match(/^\.([\w-]+)$/)[1];
+        const candidates = direct ? this.children : this.descendants();
+        for (const el of candidates) if (el.className.split(' ').includes(cls)) return el;
+        return null;
     }
-    getPropertyPriority(prop) {
-        if (prop !== 'outline') return this.props.get(prop)?.priority ?? '';
-        return this.getPropertyValue('outline') ? this.props.get('outline-width').priority : '';
-    }
-    removeProperty(prop) {
-        for (const p of prop === 'outline' ? OUTLINE_LONGHANDS : [prop]) this.props.delete(p);
-    }
+    byClass(cls) { return this.children.filter((el) => el.className === cls); }
 }
 
-class FakeImg {
-    constructor(src, { width = 400, height = 300 } = {}) {
+class FakeImg extends FakeElement {
+    constructor(page, src, { width = 400, height = 300, currentSrc = src } = {}) {
+        super('img', page);
         this.src = src;
-        this.currentSrc = src;
-        this.complete = true;
+        this.currentSrc = currentSrc;
         this.naturalWidth = width;
         this.naturalHeight = height;
-        this.style = new FakeStyle();
-        this.tagName = 'IMG';
-        this.isConnected = true;
-        this.listeners = [];
     }
-    setSrc(src) { this.src = src; this.currentSrc = src; }
-    addEventListener(type, fn) { if (type === 'load') this.listeners.push(fn); }
 }
 
-// Loads groups.js and content.js into one fake page, with hashing stubbed.
-function loadPage(images, hashes) {
-    const page = { images: [...images], timers: new Map(), nextTimer: 1, messages: [], observed: new Set(), observeCalls: 0, hashed: [], held: new Map(), queued: new Set(), dropped: [], intersecting: true, cleared: 0 };
+// Loads content.js into a fake page. `hashes` maps URL -> hash (missing = failed).
+function loadPage(hashes = {}, { serialize = null, deferred = false, liveMutations = false } = {}) {
+    const page = {
+        timers: new Map(), nextTimer: 1, observed: new Set(), observeCalls: [], hashed: [],
+        keyListeners: [], logs: [], tables: [], reloads: 0, constructed: { intersection: 0, mutation: 0 },
+        serialize, childListChanges: 0, waiting: new Map()
+    };
+    page.childListChanged = (record) => {
+        page.childListChanges++;
+        if (liveMutations && page.mutate) page.mutate([record]);
+    };
+    // Release a deferred hash and let its result settle.
+    page.resolveHash = async (src) => {
+        const resolvers = page.waiting.get(src);
+        page.waiting.delete(src);
+        for (const resolve of resolvers) resolve(src in hashes ? hashes[src] : null);
+        await new Promise((r) => setImmediate(r));
+    };
+    const body = new FakeElement('body', page);
+    page.body = body;
+
+    // An image in its own wrapper div under body.
+    page.addImage = (src, opts) => {
+        const wrapper = body.appendChild(new FakeElement('div', page));
+        const img = wrapper.appendChild(new FakeImg(page, src, opts));
+        return img;
+    };
 
     const window = {
-        addEventListener: () => {}
-    };
-    const document = {
-        addEventListener: (type, fn, capture) => { if (type === 'load' && capture) page.onLoadCapture = fn; },
-        createElement: () => ({ getContext: () => ({}) }),
-        documentElement: {},
-        querySelectorAll: (selector) => (selector === 'img' ? [...page.images] : [])
+        addEventListener: (type, fn) => { if (type === 'keydown') page.keyListeners.push(fn); },
+        getComputedStyle: (el) => ({ position: el.style.position || el.computedPosition })
     };
     const context = {
         window,
-        document,
-        console: { log() {}, warn() {}, table() {} },
-        chrome: {
-            runtime: {
-                sendMessage: (msg, cb) => { page.messages.push(msg); if (cb) cb(); },
-                lastError: undefined
-            }
+        document: {
+            body,
+            createElement: (tag) => new FakeElement(tag, page),
+            querySelectorAll: (selector) => (selector === 'img' ? [...body.descendants()].filter((el) => el.tagName === 'IMG') : [])
         },
-        setTimeout: (fn) => { const id = page.nextTimer++; page.timers.set(id, fn); return id; },
-        clearTimeout: (id) => { page.cleared++; page.timers.delete(id); },
+        location: { reload: () => { page.reloads++; } },
+        console: {
+            log: (...args) => page.logs.push(args.map(String).join(' ')),
+            warn() {},
+            table: (rows) => page.tables.push(Array.from(rows, (r) => ({ ...r, urls: Array.from(r.urls) })))
+        },
+        setTimeout: (fn, ms) => { const id = page.nextTimer++; page.timers.set(id, { fn, ms }); return id; },
+        clearTimeout: (id) => { page.timers.delete(id); },
         IntersectionObserver: class {
-            constructor(callback) { page.intersect = callback; this.callback = callback; }
-            observe(el) { page.observeCalls++; page.observed.add(el); }
+            constructor(callback, options) {
+                page.constructed.intersection++;
+                page.intersect = callback;
+                page.intersectionOptions = options;
+            }
+            observe(el) { page.observeCalls.push(el); page.observed.add(el); }
             unobserve(el) { page.observed.delete(el); }
         },
         MutationObserver: class {
-            constructor(callback) { page.mutate = callback; }
-            observe() {}
+            constructor(callback) {
+                page.constructed.mutation++;
+                page.mutate = (records = [{ addedNodes: [new FakeElement('div', page)], removedNodes: [] }]) =>
+                    callback(records, this);
+            }
+            observe(target, options) { page.mutationTarget = target; page.mutationOptions = options; }
         }
     };
     vm.createContext(context);
     // Stands in for hash.js: fixed hashes per URL instead of fetching and decoding.
     window.DuplicateImageHash = {
-        pendingCount: () => 0,
+        hammingDistance,
         queueHash: (src) => {
             page.hashed.push(src);
-            const result = () => (src in hashes ? { hash: hashes[src], solid: false } : null);
-            if (!page.held.has(src)) return Promise.resolve(result());
-            return new Promise((resolve) => page.held.set(src, (value) => resolve(value ?? result())));
-        },
-        // Only hashes held as queued (not yet started) can be dropped.
-        dropQueued: (isUnwanted) => {
-            for (const [src, done] of page.held) {
-                if (done && page.queued.has(src) && isUnwanted(src)) {
-                    page.held.delete(src);
-                    page.dropped.push(src);
-                    done({ dropped: true });
-                }
-            }
+            if (!deferred) return Promise.resolve(src in hashes ? hashes[src] : null);
+            return new Promise((resolve) => {
+                if (!page.waiting.has(src)) page.waiting.set(src, []);
+                page.waiting.get(src).push(resolve);
+            });
         }
     };
-    vm.runInContext(read('groups.js'), context);
-    vm.runInContext(read('content.js'), context);
+    page.inject = () => vm.runInContext(read('content.js'), context);
+    page.inject();
+    page.window = window;
 
-    // Bring every observed image into view, let hashes resolve, run all timers.
+    page.runTimers = () => {
+        const due = [...page.timers.values()];
+        page.timers.clear();
+        for (const { fn } of due) fn();
+    };
+    // Bring the given (default: all observed) images into view and let hashes resolve.
+    page.scroll = async (imgs = [...page.observed]) => {
+        page.intersect(imgs.map((target) => ({ target, isIntersecting: true })));
+        await new Promise((r) => setImmediate(r));
+    };
+    // Initial pass after 500ms, then everything scrolls into view.
     page.settle = async () => {
-        for (let round = 0; round < 10; round++) {
-            const visible = page.intersecting ? [...page.observed] : [];
-            if (visible.length) page.intersect(visible.map((target) => ({ target, isIntersecting: true })));
-            await new Promise((r) => setImmediate(r));
-            const due = [...page.timers.entries()];
-            page.timers.clear();
-            for (const [, fn] of due) fn();
-            if (!visible.length && !due.length) return;
-        }
-        throw new Error('page did not settle');
+        page.runTimers();
+        await page.scroll();
     };
-    // What the page does after a DOM change: the mutation observer fires.
-    page.changed = async () => {
-        page.mutate();
-        await page.settle();
+    page.press = (code, { altKey = true, shiftKey = true } = {}) => {
+        for (const fn of page.keyListeners) fn({ code, altKey, shiftKey });
     };
-    // A hash for this URL stays in flight (or, with queued, waiting its turn) until release(src).
-    page.hold = (src, { queued = false } = {}) => {
-        page.held.set(src, null);
-        if (queued) page.queued.add(src);
-    };
-    page.release = (src) => { const done = page.held.get(src); page.held.delete(src); done(); };
-    // The browser finished loading an image (no DOM mutation involved).
-    page.loaded = async (img) => {
-        page.onLoadCapture({ target: img });
-        await page.settle();
-    };
-    page.remove = (img) => {
-        page.images = page.images.filter((i) => i !== img);
-        img.isConnected = false;
-    };
-    // The browser finished loading this image (its own 'load' listeners).
-    page.imageLoaded = async (img) => {
-        img.complete = true;
-        for (const fn of img.listeners.splice(0)) fn();
-        await page.settle();
-    };
-    page.badge = () => page.messages.filter((m) => m.action === 'SCAN_STATUS').at(-1)?.groups;
-    page.reinject = () => vm.runInContext(read('content.js'), context);
     return page;
 }
 
-const outlined = (img) => img.style.getPropertyValue('outline') !== '';
+const stripeOf = (img) => img.parentElement.byClass('dih-stripe');
+const pillOf = (img) => img.parentElement.byClass('dih-count');
+const isMarked = (img) => stripeOf(img).length === 1 && pillOf(img).length === 1;
 
-test('different URLs that look alike are outlined; a unique image is not', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const u = new FakeImg('https://x.example/u.png');
-    const page = loadPage([a1, a2, u], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW, [u.src]: HASH_HIGH });
-    await page.settle();
-    assert.equal(outlined(a1), true);
-    assert.equal(outlined(a2), true);
-    assert.equal(outlined(u), false);
-    assert.equal(a1.style.getPropertyPriority('outline'), 'important');
-    assert.equal(page.badge(), 1);
-});
+function expectedStyles(count) {
+    const t = (Math.min(count, 10) - 1) / 9;
+    const hue = 200 - 200 * t;
+    const a = `hsla(${hue}, 100%, 50%, 0.3)`;
+    const b = `hsla(${hue}, 100%, 50%, 0.05)`;
+    return {
+        hue,
+        background: `repeating-linear-gradient(45deg, ${a}, ${a} 2px, ${b} 2px, ${b} ${20 - 15 * t}px)`
+    };
+}
 
-test('the same URL shown twice is not outlined', async () => {
-    const one = new FakeImg('https://x.example/a.png');
-    const two = new FakeImg('https://x.example/a.png');
-    const page = loadPage([one, two], { [one.src]: HASH_LOW });
-    await page.settle();
-    assert.equal(outlined(one), false);
-    assert.equal(outlined(two), false);
-    assert.deepEqual(page.hashed, [one.src], 'hashed once');
-    assert.equal(page.badge(), 0);
-});
+function assertMarked(img, count, literal) {
+    const { hue, background } = expectedStyles(count);
+    if (literal) {
+        assert.equal(hue, literal.hue);
+        assert.equal(background, literal.background);
+    }
+    assert.equal(img.style.outline, `3px solid hsl(${hue}, 100%, 50%)`);
+    assert.equal(img.style.outlineOffset, '-4px');
 
-test('changing a src to a unique image clears both outlines and the badge count', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW, 'https://x.example/u.png': HASH_HIGH });
-    await page.settle();
-    assert.equal(page.badge(), 1);
-
-    a2.setSrc('https://x.example/u.png');
-    await page.changed();
-    assert.equal(outlined(a1), false);
-    assert.equal(outlined(a2), false);
-    assert.equal(page.badge(), 0);
-});
-
-test('removing one of a pair clears the other', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW });
-    await page.settle();
-    page.images = [a1];
-    await page.changed();
-    assert.equal(outlined(a1), false);
-    assert.equal(page.badge(), 0);
-});
-
-test('an image added later joins the group and recolors it', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const a3 = new FakeImg('https://x.example/a3.png');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW, [a3.src]: HASH_LOW });
-    await page.settle();
-    const pairColor = a1.style.getPropertyValue('outline');
-    page.images.push(a3);
-    await page.changed();
-    assert.equal(outlined(a3), true);
-    assert.notEqual(a1.style.getPropertyValue('outline'), pairColor);
-    assert.equal(a1.style.getPropertyValue('outline'), a3.style.getPropertyValue('outline'));
-});
-
-test('clearing restores each outline property the page still owns, independently', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    a1.style.setProperty('outline', '1px dotted red');
-    a1.style.setProperty('outline-offset', '2px', 'important');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW, 'https://x.example/u.png': HASH_MID });
-    await page.settle();
-    assert.equal(a1.style.getPropertyValue('outline-offset'), '-4px');
-
-    // The page takes over outline-offset only; outline is still ours.
-    a1.style.setProperty('outline-offset', '9px');
-    a2.setSrc('https://x.example/u.png');
-    await page.changed();
-    assert.equal(a1.style.getPropertyValue('outline'), '1px dotted red');
-    assert.equal(a1.style.getPropertyPriority('outline'), '');
-    assert.equal(a1.style.getPropertyValue('outline-offset'), '9px');
-});
-
-test('an image without inline outline styles is left without them', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW });
-    await page.settle();
-    page.images = [a2];
-    await page.changed();
-    assert.equal(a1.style.props.size, 0);
-});
-
-test('images 100x50 or smaller are never hashed', async () => {
-    const icon = new FakeImg('https://x.example/icon.png', { width: 100, height: 100 });
-    const page = loadPage([icon], {});
-    await page.settle();
-    assert.deepEqual(page.hashed, []);
-    const calls = page.observeCalls;
-    await page.changed();
-    assert.deepEqual(page.hashed, []);
-    assert.equal(page.observeCalls, calls, 'a known-small URL is not watched again');
-});
-
-test('an outline the page sets while highlighted is what clearing restores', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const a3 = new FakeImg('https://x.example/a3.png');
-    a1.style.setProperty('outline', '1px dotted red');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW, [a3.src]: HASH_LOW });
-    await page.settle();
-
-    a1.style.setProperty('outline', '3px dashed blue'); // page's own change while highlighted
-    page.images.push(a3); // group grows: the highlight is re-applied over it
-    await page.changed();
-    assert.match(a1.style.getPropertyValue('outline'), /^4px solid/);
-
-    page.images = [a1];
-    await page.changed();
-    assert.equal(a1.style.getPropertyValue('outline'), '3px dashed blue');
-});
-
-test('clicking again retries an image that failed', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const hashes = { [a1.src]: HASH_LOW };
-    const page = loadPage([a1, a2], hashes);
-    await page.settle();
-    assert.equal(outlined(a1), false);
-
-    hashes[a2.src] = HASH_LOW; // the second fetch works
-    await page.changed();
-    assert.equal(outlined(a1), false, 'a failed URL is not retried on its own');
-    page.reinject();
-    await page.settle();
-    assert.equal(outlined(a1), true);
-    assert.equal(outlined(a2), true);
-});
-
-test('an image whose currentSrc changes on load, with no DOM change, is regrouped', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const lazy = new FakeImg('https://x.example/placeholder.png');
-    const page = loadPage([a1, lazy], {
-        [a1.src]: HASH_LOW,
-        'https://x.example/placeholder.png': HASH_HIGH,
-        'https://x.example/a2-800w.png': HASH_LOW
+    const [stripe] = stripeOf(img);
+    assert.ok(stripe, 'stripe overlay');
+    assert.deepEqual({ ...stripe.style }, {
+        position: 'absolute',
+        top: '0',
+        left: '0',
+        width: '100%',
+        height: '100%',
+        backgroundImage: background,
+        pointerEvents: 'none',
+        zIndex: String(1000 + count - 1),
+        borderRadius: 'inherit'
     });
-    await page.settle();
-    assert.equal(outlined(a1), false);
 
-    lazy.currentSrc = 'https://x.example/a2-800w.png'; // srcset candidate picked; src attribute unchanged
-    await page.loaded(lazy);
-    assert.equal(outlined(a1), true);
-    assert.equal(outlined(lazy), true);
-    assert.equal(page.badge(), 1);
+    const [pill] = pillOf(img);
+    assert.ok(pill, 'count pill');
+    assert.equal(pill.textContent, String(count));
+    assert.equal(pill.getAttribute('title'), `Duplicate: ${count} copies on this page`);
+    assert.deepEqual({ ...pill.style }, {
+        position: 'absolute',
+        top: '4px',
+        right: '4px',
+        backgroundColor: `hsl(${hue}, 100%, 30%)`,
+        color: '#fff',
+        padding: '2px 6px',
+        borderRadius: '12px',
+        fontSize: '12px',
+        fontWeight: 'bold',
+        fontFamily: 'sans-serif',
+        zIndex: String(1000 + count),
+        boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
+        pointerEvents: 'none'
+    });
+}
+
+test('observers: 500px root margin, threshold 0, childList+subtree on body, first pass after 500ms', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE });
+    const img = page.addImage('https://x.example/a.jpg');
+    assert.deepEqual({ ...page.intersectionOptions }, { rootMargin: '500px', threshold: 0 });
+    assert.equal(page.mutationTarget, page.body);
+    assert.deepEqual({ ...page.mutationOptions }, { childList: true, subtree: true });
+
+    assert.deepEqual([...page.timers.values()].map((t) => t.ms), [500]);
+    assert.equal(page.observed.size, 0, 'nothing observed before the first pass');
+    page.runTimers();
+    assert.deepEqual([...page.observed], [img]);
+
+    await page.scroll();
+    assert.equal(page.observed.size, 0, 'unobserved once it intersected');
+    assert.deepEqual(page.hashed, ['https://x.example/a.jpg']);
 });
 
-test('a hash that resolves after its image was removed does not outline anything', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW });
-    page.hold(a2.src);
-    await page.settle();
-    page.images = [a1];
-    await page.changed();
-    page.release(a2.src);
-    await page.settle();
-    assert.equal(outlined(a1), false);
-    assert.equal(page.badge(), 0);
+test('DOM changes are debounced to one observe pass 500ms after the last one', async () => {
+    const page = loadPage();
+    page.runTimers();
+    page.addImage('https://x.example/a.jpg');
+    page.mutate();
+    page.mutate();
+    page.mutate();
+    assert.deepEqual([...page.timers.values()].map((t) => t.ms), [500]);
+    page.runTimers();
+    assert.equal(page.observeCalls.length, 1);
 });
 
-test('a hash that resolves after its image changed src does not outline the new image', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW, 'https://x.example/u.png': HASH_HIGH });
-    page.hold(a2.src);
+test('two different URLs that look the same get the stripe and pill for count 2', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
+    const a = page.addImage('https://x.example/a.jpg');
+    const b = page.addImage('https://x.example/b.jpg');
     await page.settle();
-    a2.setSrc('https://x.example/u.png');
-    await page.changed();
-    page.release('https://x.example/a2.png');
-    await page.settle();
-    assert.equal(outlined(a1), false);
-    assert.equal(outlined(a2), false);
-    assert.equal(page.badge(), 0);
+    const literal = {
+        hue: 177.77777777777777,
+        background: 'repeating-linear-gradient(45deg, hsla(177.77777777777777, 100%, 50%, 0.3), ' +
+            'hsla(177.77777777777777, 100%, 50%, 0.3) 2px, hsla(177.77777777777777, 100%, 50%, 0.05) 2px, ' +
+            'hsla(177.77777777777777, 100%, 50%, 0.05) 18.333333333333332px)'
+    };
+    assertMarked(a, 2, literal);
+    assertMarked(b, 2, literal);
+    assert.equal(a.parentElement.style.position, 'relative', 'static parent made relative');
 });
 
-test('an outline whose priority the page changed is left to the page', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW });
-    await page.settle();
-    const ours = a1.style.getPropertyValue('outline');
-    a1.style.setProperty('outline', ours, ''); // same value, page dropped !important
-    page.remove(a2);
-    await page.changed();
-    assert.equal(a1.style.getPropertyValue('outline'), ours);
-    assert.equal(a1.style.getPropertyPriority('outline'), '');
-    assert.equal(a1.style.getPropertyValue('outline-offset'), '', 'the property still ours is restored');
-});
-
-test('queued hashes for images that left the page are dropped, and redone if they return', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const gone = Array.from({ length: 5 }, (_, i) => new FakeImg(`https://x.example/gone${i}.png`));
-    const hashes = { [a1.src]: HASH_LOW };
-    for (const img of gone) hashes[img.src] = HASH_LOW;
-    const page = loadPage([a1, ...gone], hashes);
-    for (const img of gone) page.hold(img.src, { queued: true });
-    await page.settle();
-
-    for (const img of gone) page.remove(img);
-    await page.changed();
-    assert.deepEqual(page.dropped.sort(), gone.map((img) => img.src).sort());
-
-    const back = gone[0];
-    back.isConnected = true;
-    page.images.push(back);
-    await page.changed();
-    assert.equal(page.hashed.filter((src) => src === back.src).length, 2, 'hashed again');
-    assert.equal(outlined(a1), true);
-    assert.equal(outlined(back), true);
-});
-
-test('an image removed before it came into view is no longer watched', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const page = loadPage([a1], {});
-    page.intersecting = false;
-    await page.settle();
-    assert.equal(page.observed.has(a1), true);
-    page.remove(a1);
-    await page.changed();
-    assert.equal(page.observed.has(a1), false);
-});
-
-test('an image removed while waiting to load is not hashed when the load arrives', async () => {
-    const lazy = new FakeImg('https://x.example/lazy.png');
-    lazy.complete = false;
-    lazy.naturalWidth = 0;
-    const page = loadPage([lazy], { [lazy.src]: HASH_LOW });
-    await page.settle();
-    page.remove(lazy);
-    await page.changed();
-    lazy.naturalWidth = 400;
-    await page.imageLoaded(lazy);
-    assert.deepEqual(page.hashed, []);
-});
-
-test('a lazy image is hashed once it loads', async () => {
-    const lazy = new FakeImg('https://x.example/lazy.png');
-    lazy.complete = false;
-    lazy.naturalWidth = 0;
-    const page = loadPage([lazy], { [lazy.src]: HASH_LOW });
-    await page.settle();
-    assert.deepEqual(page.hashed, []);
-    lazy.naturalWidth = 400;
-    await page.imageLoaded(lazy);
-    assert.deepEqual(page.hashed, [lazy.src]);
-});
-
-test('the badge keeps updating while hashes keep arriving', async () => {
-    const images = Array.from({ length: 12 }, (_, i) => new FakeImg(`https://x.example/i${i}.png`));
+test('ten look-alike URLs get the red stripe and pill for count 10', async () => {
     const hashes = {};
-    for (const img of images) hashes[img.src] = HASH_LOW;
-    const page = loadPage(images, hashes);
+    for (let i = 0; i < 10; i++) hashes[`https://x.example/${i}.jpg`] = hashWithFlips(0, i % 3); // within 2 bits
+    const page = loadPage(hashes);
+    const imgs = Object.keys(hashes).map((src) => page.addImage(src));
     await page.settle();
-    assert.equal(page.cleared, 0, 'a pending badge update is never pushed back');
-    assert.equal(page.badge(), 1);
+    for (const img of imgs) {
+        assertMarked(img, 10, {
+            hue: 0,
+            background: 'repeating-linear-gradient(45deg, hsla(0, 100%, 50%, 0.3), hsla(0, 100%, 50%, 0.3) 2px, ' +
+                'hsla(0, 100%, 50%, 0.05) 2px, hsla(0, 100%, 50%, 0.05) 5px)'
+        });
+    }
 });
 
-test('a page that sets only one outline longhand gets exactly that back', async () => {
-    const a1 = new FakeImg('https://x.example/a1.png');
-    const a2 = new FakeImg('https://x.example/a2.png');
-    a1.style.setProperty('outline-color', 'red');
-    const page = loadPage([a1, a2], { [a1.src]: HASH_LOW, [a2.src]: HASH_LOW });
+test('the hue stops at red above 10, but the count and z-index keep going', () => {
+    const page = loadPage();
+    const img = page.addImage('https://x.example/a.jpg');
+    page.window.__duplicateImageHighlighter.markDuplicate(img, 12);
+    assert.equal(img.style.outline, '3px solid hsl(0, 100%, 50%)');
+    assert.equal(pillOf(img)[0].textContent, '12');
+    assert.equal(pillOf(img)[0].style.zIndex, '1012');
+    assert.equal(stripeOf(img)[0].style.zIndex, '1011');
+});
+
+test('re-marking replaces the stripe and pill; a count of 1 clears them and the outline', () => {
+    const page = loadPage();
+    const img = page.addImage('https://x.example/a.jpg');
+    const { markDuplicate } = page.window.__duplicateImageHighlighter;
+    markDuplicate(img, 2);
+    markDuplicate(img, 3);
+    assert.equal(stripeOf(img).length, 1);
+    assert.equal(pillOf(img).length, 1);
+    assertMarked(img, 3);
+
+    const [stripe] = stripeOf(img);
+    const [pill] = pillOf(img);
+    markDuplicate(img, 3);
+    assert.equal(stripeOf(img)[0], stripe, 'same count keeps the stripe');
+    assert.equal(pillOf(img)[0], pill, 'same count keeps the pill');
+
+    markDuplicate(img, 1);
+    assert.equal(stripeOf(img).length, 0);
+    assert.equal(pillOf(img).length, 0);
+    assert.equal(img.style.outline, '');
+    assert.deepEqual(img.parentElement.children, [img]);
+});
+
+test('a positioned parent keeps its position', () => {
+    const page = loadPage();
+    const img = page.addImage('https://x.example/a.jpg');
+    img.parentElement.computedPosition = 'absolute';
+    page.window.__duplicateImageHighlighter.markDuplicate(img, 2);
+    assert.equal(img.parentElement.style.position, undefined);
+});
+
+test('the same URL twice is not a duplicate', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE });
+    const a = page.addImage('https://x.example/a.jpg');
+    const b = page.addImage('https://x.example/a.jpg');
     await page.settle();
-    assert.equal(outlined(a1), true);
-    page.remove(a2);
-    await page.changed();
-    assert.deepEqual([...a1.style.props.entries()], [['outline-color', { value: 'red', priority: '' }]]);
+    assert.equal(isMarked(a), false);
+    assert.equal(isMarked(b), false);
+    assert.equal(a.style.outline, undefined);
+});
+
+test('a new hash joins the first stored hash within 5 bits: no chaining, order matters', async () => {
+    // A~B (4 bits), B~C (4 bits), A and C 8 bits apart.
+    const A = BASE;
+    const B = hashWithFlips(0, 4);
+    const C = hashWithFlips(0, 8);
+    assert.deepEqual([hammingDistance(A, B), hammingDistance(B, C), hammingDistance(A, C)], [4, 4, 8]);
+    const urls = { a: 'https://x.example/a.jpg', b: 'https://x.example/b.jpg', c: 'https://x.example/c.jpg' };
+    const hashes = { [urls.a]: A, [urls.b]: B, [urls.c]: C };
+
+    // Order A, B, C: B joins A; C is 8 bits from A, so it starts its own key.
+    let page = loadPage(hashes);
+    let imgs = ['a', 'b', 'c'].map((k) => page.addImage(urls[k]));
+    await page.settle();
+    assert.deepEqual(imgs.map(isMarked), [true, true, false]);
+    assert.equal(pillOf(imgs[0])[0].textContent, '2');
+
+    // Order B, A, C: both A and C are within 5 bits of B, so all three share B's key.
+    page = loadPage(hashes);
+    imgs = ['b', 'a', 'c'].map((k) => page.addImage(urls[k]));
+    await page.settle();
+    assert.deepEqual(imgs.map(isMarked), [true, true, true]);
+    assert.equal(pillOf(imgs[0])[0].textContent, '3');
+});
+
+test('images with no src, data: URLs and images not bigger than 100x50 are never hashed', async () => {
+    const page = loadPage();
+    page.addImage('');
+    page.addImage('data:image/png;base64,AAAA');
+    page.addImage('https://x.example/narrow.jpg', { width: 100, height: 300 });
+    page.addImage('https://x.example/short.jpg', { width: 400, height: 50 });
+    page.addImage('https://x.example/ok.jpg', { width: 101, height: 51 });
+    await page.settle();
+    assert.deepEqual(page.hashed, ['https://x.example/ok.jpg']);
+});
+
+test('hashes that are all 0 or all f are skipped, so flat placeholders never match', async () => {
+    const page = loadPage({
+        'https://x.example/0a.jpg': HASH_LOW,
+        'https://x.example/0b.jpg': HASH_LOW,
+        'https://x.example/fa.jpg': HASH_HIGH,
+        'https://x.example/fb.jpg': HASH_HIGH
+    });
+    const imgs = ['0a', '0b', 'fa', 'fb'].map((n) => page.addImage(`https://x.example/${n}.jpg`));
+    await page.settle();
+    assert.equal(page.hashed.length, 4);
+    assert.deepEqual(imgs.map(isMarked), [false, false, false, false]);
+    page.press('KeyD');
+    assert.ok(page.logs.includes('Processed URLs: 0'));
+    assert.ok(page.logs.includes('Unique hashes: 0'));
+});
+
+test('every image showing a URL in the group is marked, by currentSrc or src', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
+    page.addImage('https://x.example/a.jpg');
+    page.addImage('https://x.example/b.jpg');
+    // Not observed yet when the group forms: matched by src (currentSrc empty)
+    const late = page.addImage('https://x.example/a.jpg', { currentSrc: '' });
+    page.runTimers();
+    page.observed.delete(late);
+    await page.scroll();
+    assertMarked(late, 2);
+});
+
+test('an image added later with a known URL is marked by the observe pass, not hashed again', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
+    page.addImage('https://x.example/a.jpg');
+    page.addImage('https://x.example/b.jpg');
+    await page.settle();
+    const added = page.addImage('https://x.example/b.jpg');
+    page.mutate();
+    page.runTimers();
+    assert.equal(page.observed.has(added), false);
+    assertMarked(added, 2);
+    assert.equal(page.hashed.length, 2);
+});
+
+test('a failed URL is not retried until Alt+Shift+R reloads the page', async () => {
+    const page = loadPage({}); // every hash fails
+    page.addImage('https://x.example/broken.jpg');
+    await page.settle();
+    assert.deepEqual(page.hashed, ['https://x.example/broken.jpg']);
+
+    const again = page.addImage('https://x.example/broken.jpg');
+    page.press('KeyS');
+    assert.equal(page.observed.has(again), false, 'failed URL not observed again');
+
+    page.press('KeyD');
+    assert.ok(page.logs.includes('Failed URLs: 1'));
+    page.press('KeyR');
+    assert.equal(page.reloads, 1);
+    page.logs.length = 0;
+    page.press('KeyD');
+    assert.deepEqual(page.logs.slice(1), ['Processed URLs: 0', 'Unique hashes: 0', 'Failed URLs: 0']);
+});
+
+test('Alt+Shift+D logs counts and a table of only the groups with more than one URL', async () => {
+    const page = loadPage({
+        'https://x.example/a.jpg': BASE,
+        'https://x.example/b.jpg': BASE,
+        'https://x.example/lonely.jpg': hashWithFlips(100, 40)
+    });
+    page.addImage('https://x.example/a.jpg');
+    page.addImage('https://x.example/b.jpg');
+    page.addImage('https://x.example/lonely.jpg');
+    await page.settle();
+    page.logs.length = 0;
+    page.press('KeyD');
+    assert.deepEqual(page.logs.slice(1), ['Processed URLs: 3', 'Unique hashes: 2', 'Failed URLs: 0']);
+    assert.deepEqual(page.tables, [[{
+        hash: BASE.slice(0, 16) + '...',
+        count: 2,
+        urls: ['https://x.example/a.jpg...', 'https://x.example/b.jpg...']
+    }]]);
+});
+
+test('Alt+Shift+S runs the observe pass again', () => {
+    const page = loadPage();
+    page.runTimers();
+    const img = page.addImage('https://x.example/a.jpg');
+    page.press('KeyS');
+    assert.deepEqual([...page.observed], [img]);
+});
+
+test('only the three Alt+Shift shortcuts do anything', () => {
+    const page = loadPage();
+    page.runTimers();
+    page.addImage('https://x.example/a.jpg');
+    page.press('KeyS', { altKey: false });
+    page.press('KeyR', { shiftKey: false });
+    page.press('KeyD', { altKey: false });
+    for (const code of ['KeyA', 'KeyC', 'KeyH', 'KeyX']) page.press(code);
+    assert.equal(page.observed.size, 0);
+    assert.equal(page.reloads, 0);
+    assert.equal(page.tables.length, 0);
+    assert.equal(page.keyListeners.length, 1);
+});
+
+test('a second injection rescans once and adds no observer or shortcut listener', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE });
+    page.runTimers();
+    const img = page.addImage('https://x.example/a.jpg');
+
+    page.inject();
+    assert.deepEqual(page.observeCalls, [img], 'observe pass ran once');
+    assert.deepEqual(page.constructed, { intersection: 1, mutation: 1 });
+    assert.equal(page.keyListeners.length, 1);
+    assert.equal(page.timers.size, 0, 'no second delayed first pass');
+
+    page.inject();
+    assert.deepEqual(page.observeCalls, [img], 'an image already observed is not observed twice');
+});
+
+test('re-marking with the same count leaves the page alone, so the scan settles', async () => {
+    // A browser reads inline styles back re-serialized; the fake drops the space after commas.
+    const page = loadPage(
+        { 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE },
+        { serialize: (value) => String(value).replace(/, /g, ','), liveMutations: true }
+    );
+    page.addImage('https://x.example/a.jpg');
+    page.addImage('https://x.example/b.jpg');
+    await page.settle();
+
+    // Known URL, never observed: every pass remarks it.
+    const late = page.addImage('https://x.example/b.jpg');
+    page.runTimers();
+    assert.equal(pillOf(late)[0].textContent, '2');
+    assert.equal(late.style.outline, '3px solid hsl(177.77777777777777,100%,50%)');
+    const [stripe] = stripeOf(late);
+    const [pill] = pillOf(late);
+
+    // Adding our own stripe and pill schedules no pass; a repeat pass changes nothing.
+    assert.equal(page.timers.size, 0, 'no pass scheduled by our own decorations');
+    const changes = page.childListChanges;
+    page.press('KeyS');
+    assert.equal(page.childListChanges, changes, 'no stripe or pill removed or added');
+    assert.equal(page.timers.size, 0);
+    assert.equal(stripeOf(late)[0], stripe);
+    assert.equal(pillOf(late)[0], pill);
+});
+
+test('two images sharing a parent with different counts do not keep rescheduling the scan', async () => {
+    const urls = {
+        a: 'https://x.example/a.jpg', a2: 'https://x.example/a2.jpg',
+        b: 'https://x.example/b.jpg', b2: 'https://x.example/b2.jpg', b3: 'https://x.example/b3.jpg'
+    };
+    const B = hashWithFlips(100, 40);
+    const page = loadPage(
+        { [urls.a]: BASE, [urls.a2]: BASE, [urls.b]: B, [urls.b2]: B, [urls.b3]: B },
+        { liveMutations: true }
+    );
+    for (const src of Object.values(urls)) page.addImage(src);
+    await page.settle();
+    page.runTimers(); // the pass the decorations above used to schedule, if any
+
+    // Known URLs, never observed: every pass remarks both, and each replaces the other's pill.
+    const shared = page.body.appendChild(new FakeElement('div', page));
+    const imgA = shared.appendChild(new FakeImg(page, urls.a));
+    const imgB = shared.appendChild(new FakeImg(page, urls.b));
+    assert.equal(page.timers.size, 1, 'adding the images schedules a pass');
+    const changes = page.childListChanges;
+    page.runTimers();
+    assert.ok(page.childListChanges > changes, 'the pass swapped the shared stripe and pill');
+    assert.equal(pillOf(imgB)[0].textContent, '3');
+    assert.equal(imgA.style.outline, `3px solid hsl(${expectedStyles(2).hue}, 100%, 50%)`);
+
+    assert.equal(page.timers.size, 0, 'our own stripe and pill swaps schedule no pass');
+    const swapped = page.childListChanges;
+    page.press('KeyS');
+    assert.ok(page.childListChanges > swapped, 'a rescan swaps them again');
+    assert.equal(page.timers.size, 0, 'and still schedules no pass');
+
+    // A real page change still schedules one.
+    page.body.appendChild(new FakeElement('div', page));
+    assert.equal(page.timers.size, 1);
+});
+
+test('a page that rewrote the outline or pill gets it back, without touching what still matches', () => {
+    const page = loadPage();
+    const img = page.addImage('https://x.example/a.jpg');
+    const { markDuplicate } = page.window.__duplicateImageHighlighter;
+    markDuplicate(img, 2);
+    const [stripe] = stripeOf(img);
+    const [pill] = pillOf(img);
+
+    img.style.outline = 'none';
+    const changes = page.childListChanges;
+    markDuplicate(img, 2);
+    assertMarked(img, 2);
+    assert.equal(page.childListChanges, changes, 'only the outline was rewritten');
+    assert.equal(stripeOf(img)[0], stripe);
+
+    pill.style.zIndex = '1';
+    markDuplicate(img, 2);
+    assertMarked(img, 2);
+    assert.notEqual(pillOf(img)[0], pill, 'a changed pill is replaced');
+});
+
+test('only the direct-child stripe and pill belong to an image; a nested image keeps its own', () => {
+    const page = loadPage();
+    const { markDuplicate } = page.window.__duplicateImageHighlighter;
+    const outer = page.addImage('https://x.example/outer.jpg');
+    const innerWrapper = outer.parentElement.appendChild(new FakeElement('div', page));
+    const inner = innerWrapper.appendChild(new FakeImg(page, 'https://x.example/inner.jpg'));
+
+    // The nested decoration showing the same count is not taken as the outer image's.
+    markDuplicate(inner, 3);
+    markDuplicate(outer, 3);
+    assertMarked(inner, 3);
+    assertMarked(outer, 3);
+    const [innerStripe] = stripeOf(inner);
+    const [innerPill] = pillOf(inner);
+
+    markDuplicate(outer, 4);
+    assertMarked(outer, 4);
+    markDuplicate(outer, 1);
+    assert.deepEqual(outer.parentElement.children, [outer, innerWrapper]);
+    assertMarked(inner, 3);
+    assert.equal(stripeOf(inner)[0], innerStripe);
+    assert.equal(pillOf(inner)[0], innerPill);
+});
+
+test('a URL whose hash is in flight is not queued again; its other images share the result', async () => {
+    const urls = { a: 'https://x.example/a.jpg', b: 'https://x.example/b.jpg' };
+    const page = loadPage({ [urls.a]: BASE, [urls.b]: BASE }, { deferred: true });
+    const a1 = page.addImage(urls.a);
+    const a2 = page.addImage(urls.a);
+    const b = page.addImage(urls.b);
+    page.runTimers();
+
+    await page.scroll([a1]);
+    await page.scroll([a2, b]);
+    assert.deepEqual(page.hashed, [urls.a, urls.b]);
+
+    await page.resolveHash(urls.b);
+    await page.resolveHash(urls.a);
+    for (const img of [a1, a2, b]) assertMarked(img, 2);
+    assert.deepEqual(page.hashed, [urls.a, urls.b], 'each URL hashed once');
+});
+
+test('an image waiting on an in-flight hash is not marked if its src changed meanwhile', async () => {
+    const urls = { a: 'https://x.example/a.jpg', b: 'https://x.example/b.jpg', unique: 'https://x.example/unique.jpg' };
+    const page = loadPage({ [urls.a]: BASE, [urls.b]: BASE }, { deferred: true });
+    const first = page.addImage(urls.a);
+    const second = page.addImage(urls.a);
+    const b = page.addImage(urls.b);
+    page.runTimers();
+    await page.scroll([first]);
+    await page.scroll([second, b]);
+    await page.resolveHash(urls.b);
+
+    second.src = second.currentSrc = urls.unique;
+    await page.resolveHash(urls.a);
+    assertMarked(first, 2);
+    assertMarked(b, 2);
+    assert.equal(isMarked(second), false);
+    assert.deepEqual(pillOf(second), []);
+    assert.equal(second.style.outline, undefined);
+    assert.deepEqual(page.hashed, [urls.a, urls.b], 'the new URL is not hashed');
+});
+
+test('the in-flight mark clears when the hash finishes', async () => {
+    // A flat hash is not stored, so a later image with that URL is hashed again
+    // unless a stale in-flight mark holds it back.
+    const flat = 'https://x.example/flat.jpg';
+    const page = loadPage({ [flat]: HASH_LOW }, { deferred: true });
+    const first = page.addImage(flat);
+    const second = page.addImage(flat);
+    page.runTimers();
+    await page.scroll([first, second]);
+    assert.deepEqual(page.hashed, [flat]);
+    await page.resolveHash(flat);
+
+    const later = page.addImage(flat);
+    page.mutate();
+    page.runTimers();
+    await page.scroll([later]);
+    assert.deepEqual(page.hashed, [flat, flat]);
+});
+
+test('an image removed before it came into view is no longer watched; one still on the page is', () => {
+    const page = loadPage();
+    page.runTimers();
+    const gone = page.addImage('https://x.example/gone.jpg');
+    const kept = page.addImage('https://x.example/kept.jpg');
+    page.mutate();
+    page.runTimers();
+    assert.deepEqual([...page.observed], [gone, kept]);
+
+    const wrapper = gone.parentElement;
+    wrapper.remove();
+    page.mutate();
+    page.runTimers();
+    assert.deepEqual([...page.observed], [kept]);
+
+    // Dropped from the observed set, so it is watched again if it comes back.
+    page.body.appendChild(wrapper);
+    page.mutate();
+    page.runTimers();
+    assert.deepEqual([...page.observed], [kept, gone]);
+    assert.deepEqual(page.observeCalls, [gone, kept, gone], 'kept observed only once');
+});
+
+test('limit: an image that came into view before it decoded is not watched again', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
+    const img = page.addImage('https://x.example/a.jpg', { width: 0, height: 0 });
+    page.runTimers();
+    await page.scroll();
+    assert.deepEqual(page.hashed, []);
+
+    img.naturalWidth = 400;
+    img.naturalHeight = 300;
+    page.press('KeyS');
+    page.mutate();
+    page.runTimers();
+    page.inject();
+    assert.deepEqual(page.observeCalls, [img], 'not observed again');
+    assert.equal(page.observed.size, 0);
+    assert.deepEqual(page.hashed, []);
+
+    // Nor is an image whose src changed after it was hashed.
+    const changed = page.addImage('https://x.example/b.jpg');
+    page.press('KeyS');
+    await page.scroll([changed]);
+    changed.src = changed.currentSrc = 'https://x.example/c.jpg';
+    page.press('KeyS');
+    assert.equal(page.observed.has(changed), false);
+    assert.deepEqual(page.hashed, ['https://x.example/b.jpg']);
+});
+
+test('limit: removing one of two matching images leaves the survivor\'s count and pill', async () => {
+    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
+    const a = page.addImage('https://x.example/a.jpg');
+    const b = page.addImage('https://x.example/b.jpg');
+    await page.settle();
+    const [pill] = pillOf(a);
+    const [stripe] = stripeOf(a);
+
+    b.parentElement.remove();
+    page.mutate();
+    page.runTimers();
+    page.press('KeyS');
+    assertMarked(a, 2);
+    assert.equal(pillOf(a)[0], pill);
+    assert.equal(stripeOf(a)[0], stripe);
 });
