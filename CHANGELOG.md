@@ -12,4 +12,4 @@ First public release.
 - Runs only when you click the toolbar button, in the top frame of that tab. Clicking again rescans. Pages that refuse injection get a `×` badge.
 - Shortcuts: Alt+Shift+R resets and reloads, Alt+Shift+D logs a debug dump, Alt+Shift+S rescans.
 - Image fetches go through the service worker without cookies, accept only `http(s)` URLs and image (or unlabeled) content types, time out after 15 seconds, and skip images over 20 MB.
-- Each GitHub Release carries a zip of the extension, ready for **Load unpacked**.
+- `scripts/package.sh` builds a zip of the extension locally, ready for **Load unpacked**.

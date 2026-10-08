@@ -6,7 +6,7 @@
 #   OUT_DIR=/some/dir scripts/package.sh 0.1.0
 #
 # Refuses unless HEAD's extension/manifest.json has that version and HEAD's
-# CHANGELOG.md has a non-empty "## <version> (YYYY-MM-DD)" section, so a tag
+# CHANGELOG.md has a non-empty "## <version> (YYYY-MM-DD)" section, so a zip
 # cannot ship stale metadata. Writes release-notes.md (that section) next to the zip.
 set -euo pipefail
 

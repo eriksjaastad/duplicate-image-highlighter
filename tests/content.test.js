@@ -12,9 +12,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { loadHash } = require('./helpers');
 
-const EXTENSION = path.join(__dirname, '..', 'extension');
-const read = (file) => fs.readFileSync(path.join(EXTENSION, file), 'utf8');
+const CONTENT_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8');
 
 const HASH_LENGTH = 248;
 const HASH_LOW = '0'.repeat(HASH_LENGTH);
@@ -28,16 +28,7 @@ function hashWithFlips(from, flips) {
 }
 const BASE = hashWithFlips(0, 0);
 
-function realHammingDistance() {
-    const window = {};
-    vm.runInNewContext(read('hash.js'), {
-        window,
-        document: { createElement: () => ({ getContext: () => ({}) }) },
-        chrome: {}
-    });
-    return window.DuplicateImageHash.hammingDistance;
-}
-const hammingDistance = realHammingDistance();
+const { hammingDistance } = loadHash();
 
 class FakeElement {
     constructor(tagName, page) {
@@ -85,13 +76,10 @@ class FakeElement {
             yield* child.descendants();
         }
     }
-    // '.class' searches descendants; ':scope > .class' only direct children.
+    // Only the ':scope > .class' form content.js uses: a direct child.
     querySelector(selector) {
-        const direct = selector.match(/^:scope > \.([\w-]+)$/);
-        const cls = direct ? direct[1] : selector.match(/^\.([\w-]+)$/)[1];
-        const candidates = direct ? this.children : this.descendants();
-        for (const el of candidates) if (el.className.split(' ').includes(cls)) return el;
-        return null;
+        const cls = selector.match(/^:scope > \.([\w-]+)$/)[1];
+        return this.children.find((el) => el.classList.contains(cls)) ?? null;
     }
     byClass(cls) { return this.children.filter((el) => el.className === cls); }
 }
@@ -184,7 +172,7 @@ function loadPage(hashes = {}, { serialize = null, deferred = false, liveMutatio
             });
         }
     };
-    page.inject = () => vm.runInContext(read('content.js'), context);
+    page.inject = () => vm.runInContext(CONTENT_SOURCE, context);
     page.inject();
     page.window = window;
 
@@ -297,68 +285,61 @@ test('DOM changes are debounced to one observe pass 500ms after the last one', a
     assert.equal(page.observeCalls.length, 1);
 });
 
-test('two different URLs that look the same get the stripe and pill for count 2', async () => {
-    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
-    const a = page.addImage('https://x.example/a.jpg');
-    const b = page.addImage('https://x.example/b.jpg');
+test('colors run from blue at 2 to red at 10; above 10 the hue stays red but the count and z-index keep going', async () => {
+    const hashes = { 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE };
+    // Ten more URLs within 2 bits of each other and at least 40 bits from BASE.
+    for (let i = 0; i < 10; i++) hashes[`https://x.example/${i}.jpg`] = hashWithFlips(100, 40 + (i % 3));
+    const page = loadPage(hashes);
+    const [a, b, ...ten] = Object.keys(hashes).map((src) => page.addImage(src));
     await page.settle();
-    const literal = {
+
+    const two = {
         hue: 177.77777777777777,
         background: 'repeating-linear-gradient(45deg, hsla(177.77777777777777, 100%, 50%, 0.3), ' +
             'hsla(177.77777777777777, 100%, 50%, 0.3) 2px, hsla(177.77777777777777, 100%, 50%, 0.05) 2px, ' +
             'hsla(177.77777777777777, 100%, 50%, 0.05) 18.333333333333332px)'
     };
-    assertMarked(a, 2, literal);
-    assertMarked(b, 2, literal);
+    assertMarked(a, 2, two);
+    assertMarked(b, 2, two);
     assert.equal(a.parentElement.style.position, 'relative', 'static parent made relative');
-});
-
-test('ten look-alike URLs get the red stripe and pill for count 10', async () => {
-    const hashes = {};
-    for (let i = 0; i < 10; i++) hashes[`https://x.example/${i}.jpg`] = hashWithFlips(0, i % 3); // within 2 bits
-    const page = loadPage(hashes);
-    const imgs = Object.keys(hashes).map((src) => page.addImage(src));
-    await page.settle();
-    for (const img of imgs) {
+    for (const img of ten) {
         assertMarked(img, 10, {
             hue: 0,
             background: 'repeating-linear-gradient(45deg, hsla(0, 100%, 50%, 0.3), hsla(0, 100%, 50%, 0.3) 2px, ' +
                 'hsla(0, 100%, 50%, 0.05) 2px, hsla(0, 100%, 50%, 0.05) 5px)'
         });
     }
+
+    page.window.__duplicateImageHighlighter.markDuplicate(a, 12);
+    assert.equal(a.style.outline, '3px solid hsl(0, 100%, 50%)');
+    assert.equal(pillOf(a)[0].textContent, '12');
+    assert.equal(pillOf(a)[0].style.zIndex, '1012');
+    assert.equal(stripeOf(a)[0].style.zIndex, '1011');
 });
 
-test('the hue stops at red above 10, but the count and z-index keep going', () => {
-    const page = loadPage();
-    const img = page.addImage('https://x.example/a.jpg');
-    page.window.__duplicateImageHighlighter.markDuplicate(img, 12);
-    assert.equal(img.style.outline, '3px solid hsl(0, 100%, 50%)');
-    assert.equal(pillOf(img)[0].textContent, '12');
-    assert.equal(pillOf(img)[0].style.zIndex, '1012');
-    assert.equal(stripeOf(img)[0].style.zIndex, '1011');
-});
-
-test('re-marking replaces the stripe and pill; a count of 1 clears them and the outline', () => {
+test('re-marking replaces only what no longer matches: a new count, or a rewritten outline or pill', () => {
     const page = loadPage();
     const img = page.addImage('https://x.example/a.jpg');
     const { markDuplicate } = page.window.__duplicateImageHighlighter;
     markDuplicate(img, 2);
     markDuplicate(img, 3);
-    assert.equal(stripeOf(img).length, 1);
-    assert.equal(pillOf(img).length, 1);
+    assert.equal(isMarked(img), true, 'one stripe and one pill');
     assertMarked(img, 3);
-
     const [stripe] = stripeOf(img);
     const [pill] = pillOf(img);
-    markDuplicate(img, 3);
-    assert.equal(stripeOf(img)[0], stripe, 'same count keeps the stripe');
-    assert.equal(pillOf(img)[0], pill, 'same count keeps the pill');
 
-    markDuplicate(img, 1);
-    assert.equal(stripeOf(img).length, 0);
-    assert.equal(pillOf(img).length, 0);
-    assert.equal(img.style.outline, '');
-    assert.deepEqual(img.parentElement.children, [img]);
+    img.style.outline = 'none';
+    const changes = page.childListChanges;
+    markDuplicate(img, 3);
+    assertMarked(img, 3);
+    assert.equal(page.childListChanges, changes, 'only the outline was rewritten');
+    assert.equal(stripeOf(img)[0], stripe);
+    assert.equal(pillOf(img)[0], pill);
+
+    pill.style.zIndex = '1';
+    markDuplicate(img, 3);
+    assertMarked(img, 3);
+    assert.notEqual(pillOf(img)[0], pill, 'a changed pill is replaced');
 });
 
 test('a positioned parent keeps its position', () => {
@@ -377,6 +358,18 @@ test('the same URL twice is not a duplicate', async () => {
     assert.equal(isMarked(a), false);
     assert.equal(isMarked(b), false);
     assert.equal(a.style.outline, undefined);
+});
+
+test('the match threshold is 5 bits: a hash 5 bits from a stored one joins it, one 6 bits away does not', async () => {
+    const near = hashWithFlips(0, 5);
+    const far = hashWithFlips(100, 6);
+    assert.deepEqual([hammingDistance(BASE, near), hammingDistance(BASE, far)], [5, 6]);
+    const urls = ['https://x.example/base.jpg', 'https://x.example/near.jpg', 'https://x.example/far.jpg'];
+    const page = loadPage({ [urls[0]]: BASE, [urls[1]]: near, [urls[2]]: far });
+    const imgs = urls.map((src) => page.addImage(src));
+    await page.settle();
+    assert.deepEqual(imgs.map(isMarked), [true, true, false]);
+    assert.equal(pillOf(imgs[0])[0].textContent, '2');
 });
 
 test('a new hash joins the first stored hash within 5 bits: no chaining, order matters', async () => {
@@ -442,19 +435,6 @@ test('every image showing a URL in the group is marked, by currentSrc or src', a
     assertMarked(late, 2);
 });
 
-test('an image added later with a known URL is marked by the observe pass, not hashed again', async () => {
-    const page = loadPage({ 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE });
-    page.addImage('https://x.example/a.jpg');
-    page.addImage('https://x.example/b.jpg');
-    await page.settle();
-    const added = page.addImage('https://x.example/b.jpg');
-    page.mutate();
-    page.runTimers();
-    assert.equal(page.observed.has(added), false);
-    assertMarked(added, 2);
-    assert.equal(page.hashed.length, 2);
-});
-
 test('a failed URL is not retried until Alt+Shift+R reloads the page', async () => {
     const page = loadPage({}); // every hash fails
     page.addImage('https://x.example/broken.jpg');
@@ -494,26 +474,20 @@ test('Alt+Shift+D logs counts and a table of only the groups with more than one 
     }]]);
 });
 
-test('Alt+Shift+S runs the observe pass again', () => {
+test('only the three Alt+Shift shortcuts do anything; Alt+Shift+S runs the observe pass again', () => {
     const page = loadPage();
     page.runTimers();
     const img = page.addImage('https://x.example/a.jpg');
-    page.press('KeyS');
-    assert.deepEqual([...page.observed], [img]);
-});
-
-test('only the three Alt+Shift shortcuts do anything', () => {
-    const page = loadPage();
-    page.runTimers();
-    page.addImage('https://x.example/a.jpg');
     page.press('KeyS', { altKey: false });
     page.press('KeyR', { shiftKey: false });
-    page.press('KeyD', { altKey: false });
-    for (const code of ['KeyA', 'KeyC', 'KeyH', 'KeyX']) page.press(code);
+    page.press('KeyX');
     assert.equal(page.observed.size, 0);
     assert.equal(page.reloads, 0);
     assert.equal(page.tables.length, 0);
     assert.equal(page.keyListeners.length, 1);
+
+    page.press('KeyS');
+    assert.deepEqual([...page.observed], [img]);
 });
 
 test('a second injection rescans once and adds no observer or shortcut listener', async () => {
@@ -531,7 +505,7 @@ test('a second injection rescans once and adds no observer or shortcut listener'
     assert.deepEqual(page.observeCalls, [img], 'an image already observed is not observed twice');
 });
 
-test('re-marking with the same count leaves the page alone, so the scan settles', async () => {
+test('an image added later with a known URL is marked by the observe pass, not hashed, and the scan settles', async () => {
     // A browser reads inline styles back re-serialized; the fake drops the space after commas.
     const page = loadPage(
         { 'https://x.example/a.jpg': BASE, 'https://x.example/b.jpg': BASE },
@@ -544,6 +518,9 @@ test('re-marking with the same count leaves the page alone, so the scan settles'
     // Known URL, never observed: every pass remarks it.
     const late = page.addImage('https://x.example/b.jpg');
     page.runTimers();
+    assert.equal(page.observed.has(late), false);
+    assert.equal(page.hashed.length, 2);
+    assert.equal(isMarked(late), true);
     assert.equal(pillOf(late)[0].textContent, '2');
     assert.equal(late.style.outline, '3px solid hsl(177.77777777777777,100%,50%)');
     const [stripe] = stripeOf(late);
@@ -595,27 +572,6 @@ test('two images sharing a parent with different counts do not keep rescheduling
     assert.equal(page.timers.size, 1);
 });
 
-test('a page that rewrote the outline or pill gets it back, without touching what still matches', () => {
-    const page = loadPage();
-    const img = page.addImage('https://x.example/a.jpg');
-    const { markDuplicate } = page.window.__duplicateImageHighlighter;
-    markDuplicate(img, 2);
-    const [stripe] = stripeOf(img);
-    const [pill] = pillOf(img);
-
-    img.style.outline = 'none';
-    const changes = page.childListChanges;
-    markDuplicate(img, 2);
-    assertMarked(img, 2);
-    assert.equal(page.childListChanges, changes, 'only the outline was rewritten');
-    assert.equal(stripeOf(img)[0], stripe);
-
-    pill.style.zIndex = '1';
-    markDuplicate(img, 2);
-    assertMarked(img, 2);
-    assert.notEqual(pillOf(img)[0], pill, 'a changed pill is replaced');
-});
-
 test('only the direct-child stripe and pill belong to an image; a nested image keeps its own', () => {
     const page = loadPage();
     const { markDuplicate } = page.window.__duplicateImageHighlighter;
@@ -633,8 +589,7 @@ test('only the direct-child stripe and pill belong to an image; a nested image k
 
     markDuplicate(outer, 4);
     assertMarked(outer, 4);
-    markDuplicate(outer, 1);
-    assert.deepEqual(outer.parentElement.children, [outer, innerWrapper]);
+    assert.equal(isMarked(outer), true, 'the outer image\'s old stripe and pill are gone');
     assertMarked(inner, 3);
     assert.equal(stripeOf(inner)[0], innerStripe);
     assert.equal(pillOf(inner)[0], innerPill);

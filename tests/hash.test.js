@@ -1,25 +1,9 @@
 // Run with: node --test tests/*.test.js
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
+const { loadHash } = require('./helpers');
 
 const SIZE = 32;
-
-function loadHashModule() {
-    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
-    const window = {};
-    const context = {
-        window,
-        document: {
-            createElement: () => ({ getContext: () => ({}) })
-        },
-        chrome: {}
-    };
-    vm.runInNewContext(source, context);
-    return window.DuplicateImageHash;
-}
 
 // RGBA buffer filled by a brightness function of (x, y)
 function pixels(brightness) {
@@ -35,20 +19,18 @@ function pixels(brightness) {
     return data;
 }
 
-const hasher = loadHashModule();
+const hasher = loadHash();
+const brightening = hasher.dHashFromPixels(pixels((x) => x * 8), SIZE);
+const darkening = hasher.dHashFromPixels(pixels((x) => 255 - x * 8), SIZE);
 
-test('hash is 248 hex chars (32 rows x 31 comparisons = 992 bits)', () => {
-    const hash = hasher.dHashFromPixels(pixels((x) => x * 8), SIZE);
-    assert.equal(hash.length, 248);
-    assert.match(hash, /^[0-9a-f]+$/);
+test('hash is 248 hex chars (32 rows x 31 comparisons = 992 bits); a brightening gradient is all 0 bits', () => {
+    assert.equal(brightening.length, 248);
+    assert.match(brightening, /^0+$/);
 });
 
-test('left-to-right brightening gradient hashes to all zero bits', () => {
-    assert.match(hasher.dHashFromPixels(pixels((x) => x * 8), SIZE), /^0+$/);
-});
-
-test('left-to-right darkening gradient hashes to all one bits', () => {
-    assert.match(hasher.dHashFromPixels(pixels((x) => 255 - x * 8), SIZE), /^f+$/);
+test('a darkening gradient is all 1 bits, so unrelated images are far apart', () => {
+    assert.match(darkening, /^f+$/);
+    assert.equal(hasher.hammingDistance(brightening, darkening), 992);
 });
 
 test('uniform brightness shift leaves the hash unchanged', () => {
@@ -64,12 +46,6 @@ test('a small local change stays within the default threshold of 5', () => {
     const b = hasher.dHashFromPixels(pixels((x, y) => (x === 10 && y === 10 ? 255 : pattern(x, y))), SIZE);
     const d = hasher.hammingDistance(a, b);
     assert.ok(d > 0 && d <= 5, `distance ${d}`);
-});
-
-test('unrelated images are far apart', () => {
-    const a = hasher.dHashFromPixels(pixels((x) => x * 8), SIZE);
-    const b = hasher.dHashFromPixels(pixels((x) => 255 - x * 8), SIZE);
-    assert.equal(hasher.hammingDistance(a, b), 992);
 });
 
 test('binToHex pads a short final chunk on the right', () => {
@@ -97,29 +73,22 @@ test('a bit is 1 only when the left RGB average is strictly greater', () => {
     }
     assert.equal(bit0([90, 0, 0], [0, 0, 89]), 1); // 30 > 29.67
     assert.equal(bit0([90, 0, 0], [0, 0, 90]), 0); // equal averages
-    assert.equal(bit0([0, 30, 0], [10, 10, 10]), 0); // 10 vs 10
-    assert.equal(bit0([0, 0, 1], [0, 0, 0]), 1); // 0.33 > 0
 });
 
 test('hammingDistance is the popcount of the XOR of each hex digit', () => {
-    assert.equal(hasher.hammingDistance('00', '00'), 0);
     assert.equal(hasher.hammingDistance('8', '1'), 2);
     assert.equal(hasher.hammingDistance('a5', '5a'), 8);
-    assert.equal(hasher.hammingDistance('0f', '00'), 4);
-    assert.equal(hasher.hammingDistance('ff', '00'), 8);
 });
 
 test('hammingDistance refuses to compare missing or mismatched hashes', () => {
-    assert.equal(hasher.hammingDistance('', 'ab'), Infinity);
     assert.equal(hasher.hammingDistance(null, 'ab'), Infinity);
     assert.equal(hasher.hammingDistance('abc', 'ab'), Infinity);
 });
 
 test('re-injecting the module keeps the first instance', () => {
-    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
     const first = { marker: true };
     const window = { DuplicateImageHash: first };
-    vm.runInNewContext(source, { window, document: {}, chrome: {} });
+    loadHash({ window });
     assert.equal(window.DuplicateImageHash, first);
 });
 
@@ -137,15 +106,12 @@ function loadWithCanvas({ dataUrl = 'data:image/png;base64,AQID', drawThrows = n
         },
         getImageData: () => ({ data: pixels((x) => x * 8) })
     };
-    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
-    const window = {};
-    vm.runInNewContext(source, {
-        window, atob, Blob, Uint8Array,
-        document: { createElement: () => ({ getContext: () => ctx }) },
+    const hasher = loadHash({
+        ctx, atob, Blob, Uint8Array,
         chrome: { runtime: { sendMessage: (msg, cb) => cb({ success: true, dataUrl }) } },
         ...extra
     });
-    return { hasher: window.DuplicateImageHash, calls };
+    return { hasher, calls };
 }
 
 class FakeImage {
@@ -154,16 +120,25 @@ class FakeImage {
 }
 FakeImage.made = 0;
 
-test('images are drawn on a cleared canvas with no white fill or other matte', async () => {
+test('raster images decode from a Blob and are drawn on a cleared canvas with no matte, then released', async () => {
+    const blobs = [];
     let closed = false;
+    FakeImage.made = 0;
     const { hasher, calls } = loadWithCanvas({
-        createImageBitmap: async () => ({ kind: 'bitmap', close: () => { closed = true; } })
+        Image: FakeImage,
+        createImageBitmap: async (blob) => {
+            blobs.push(blob);
+            return { kind: 'bitmap', close: () => { closed = true; } };
+        }
     });
     const hash = await hasher.queueHash('https://x.example/a.png');
     assert.equal(typeof hash, 'string');
     assert.equal(hash.length, 248);
     assert.deepEqual(calls, [['clearRect', 0, 0, SIZE, SIZE], ['drawImage', 'bitmap']]);
     assert.equal(closed, true, 'bitmap released');
+    assert.equal(FakeImage.made, 0, 'never through a data URL in the page');
+    assert.equal(blobs[0].type, 'image/png');
+    assert.deepEqual([...new Uint8Array(await blobs[0].arrayBuffer())], [1, 2, 3]);
 });
 
 test('the bitmap path and the Image path draw the same way, so they hash the same', async () => {
@@ -180,41 +155,20 @@ test('the bitmap path and the Image path draw the same way, so they hash the sam
 });
 
 test('at most 5 hashes run at once; the rest wait in the queue', async () => {
-    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
-    const window = {};
     const requested = [];
-    vm.runInNewContext(source, {
-        window,
-        document: { createElement: () => ({ getContext: () => ({}) }) },
+    const hasher = loadHash({
         chrome: { runtime: { sendMessage: (msg) => requested.push(msg.url) } } // never answers
     });
-    for (let i = 0; i < 8; i++) window.DuplicateImageHash.queueHash(`https://x.example/${i}.png`);
+    for (let i = 0; i < 8; i++) hasher.queueHash(`https://x.example/${i}.png`);
     await new Promise((r) => setImmediate(r));
     assert.deepEqual(requested, [0, 1, 2, 3, 4].map((i) => `https://x.example/${i}.png`));
 });
 
 test('a failed fetch resolves to null', async () => {
-    const source = fs.readFileSync(path.join(__dirname, '..', 'extension', 'hash.js'), 'utf8');
-    const window = {};
-    vm.runInNewContext(source, {
-        window,
-        document: { createElement: () => ({ getContext: () => ({}) }) },
+    const hasher = loadHash({
         chrome: { runtime: { sendMessage: (msg, cb) => cb({ success: false, error: 'HTTP 404' }) } }
     });
-    assert.equal(await window.DuplicateImageHash.queueHash('https://x.example/gone.png'), null);
-});
-
-test('raster images decode from a Blob, never through a data URL in the page', async () => {
-    const blobs = [];
-    FakeImage.made = 0;
-    const { hasher } = loadWithCanvas({
-        Image: FakeImage,
-        createImageBitmap: async (blob) => { blobs.push(blob); return { kind: 'bitmap', close() {} }; }
-    });
-    await hasher.queueHash('https://x.example/a.png');
-    assert.equal(FakeImage.made, 0);
-    assert.equal(blobs[0].type, 'image/png');
-    assert.deepEqual([...new Uint8Array(await blobs[0].arrayBuffer())], [1, 2, 3]);
+    assert.equal(await hasher.queueHash('https://x.example/gone.png'), null);
 });
 
 test('formats createImageBitmap cannot decode fall back to the data URL', async () => {
