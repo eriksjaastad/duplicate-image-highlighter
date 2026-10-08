@@ -211,13 +211,17 @@ test('refuses an undated or missing CHANGELOG section', () => {
     assert.equal(missing.status, 1);
 });
 
-test('refuses a release heading with an extra label', () => {
-    const { status, stderr, out } = run(fixture('# Changelog\n\n## 0.1.0 (unreleased) (2026-10-02)\n\n- First.\n'), '0.1.0');
+test('refuses a release heading with text after the date', () => {
+    const { status, stderr, out } = run(fixture('# Changelog\n\n## 0.1.0 (2026-10-02) extra\n\n- First.\n'), '0.1.0');
     assert.equal(status, 1);
     assert.match(stderr, /needs a section headed exactly: ## 0\.1\.0 \(YYYY-MM-DD\)/);
     assert.equal(fs.existsSync(out), false, 'nothing built');
 });
 
 test('refuses a version that is not major.minor.patch', () => {
-    assert.equal(run(fixture(), 'v0.1.0').status, 2);
+    const dir = fixture();
+    // Missing argument, then one failure past each anchor of the version regex.
+    assert.equal(run(dir).status, 2);
+    assert.equal(run(dir, 'v0.1.0').status, 2);
+    assert.equal(run(dir, '0.1.0-beta').status, 2);
 });
