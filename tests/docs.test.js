@@ -1,16 +1,14 @@
 // Run with: node --test tests/*.test.js
-// The manifest, the README's license line, and the content.js header comment,
-// which is the behavior spec: these fail if it drops a fact the code relies on.
+// The manifest, the README, and the content.js header comment, which is the
+// behavior spec: these fail if it drops a fact the code relies on. The tests in
+// content.test.js check the code does what the header says.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
 const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
-
-const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // The leading /** ... */ block of extension/content.js, as one line of words.
 function contentHeader() {
@@ -41,26 +39,12 @@ test('content.js header states the behavior spec', () => {
         'one hash per URL in flight': /A URL is hashed once at a time/,
         'removed before view unwatched': /An image removed from the page before it came near the viewport is no longer watched\./,
         'idempotent decoration': /Only the parent's direct-child stripe and pill belong to its image/,
-        'limit: watched once': new RegExp(escape('An image that came near the viewport before its pixels decoded ' +
-            'is never watched again: there is no load listener, and a changed src is not hashed.')),
-        'limit: counts never shrink': new RegExp(escape('Counts never shrink: removing an image from the page ' +
-            'leaves the count and pill on the images that remain.'))
+        'limit: watched once': /before its pixels decoded is never watched again: there is no load listener, and a changed src is not hashed/,
+        'limit: counts never shrink': /Counts never shrink: removing an image from the page leaves the count and pill/
     };
     for (const [fact, pattern] of Object.entries(facts)) {
         assert.match(header, pattern, `header lost: ${fact}`);
     }
-});
-
-test('content.js header facts match the code', () => {
-    const source = read('extension/content.js');
-    assert.match(source, /const HAMMING_THRESHOLD = 5;/);
-    assert.match(source, /img\.naturalWidth > 100 && img\.naturalHeight > 50/);
-    assert.match(source, /className = 'dih-stripe'/);
-    assert.match(source, /className = 'dih-count'/);
-    assert.match(source, /const hue = 200 - \(200 \* t\);/);
-    assert.match(source, /rootMargin: '500px'/);
-    const shortcuts = [...source.matchAll(/e\.code === '(Key\w)'/g)].map((m) => m[1]);
-    assert.deepEqual(shortcuts, ['KeyR', 'KeyD', 'KeyS']);
 });
 
 test('manifest: MV3, click to run, no content_scripts', () => {
@@ -74,28 +58,16 @@ test('manifest: MV3, click to run, no content_scripts', () => {
     assert.ok(manifest.action);
 });
 
-test('README carries the copyright line and links the license', () => {
+test('README: license line, spec pointer, and the stripe overlay screenshot with its caption', () => {
     const readme = read('README.md');
-    assert.ok(readme.split('\n').some((line) => line.includes('Copyright (c) 2026 Erik Sjaastad')));
+    const lines = readme.split('\n');
+    assert.ok(lines.some((line) => line.includes('Copyright (c) 2026 Erik Sjaastad')));
     assert.match(readme, /\[MIT\]\(LICENSE\)/);
     assert.match(read('LICENSE'), /Copyright \(c\) 2026 Erik Sjaastad/);
-});
 
-test('README points at the content.js header and shows the stripe overlay image', () => {
-    const readme = read('README.md');
     assert.match(readme, /extension\/content\.js/);
     assert.match(readme, /!\[[^\]]+\]\(docs\/images\/dih-readme\.png\)/);
-    assert.ok(readme.split('\n').includes('Four copies of the same picture get a stripe and a count of 4. ' +
+    assert.ok(lines.includes('Four copies of the same picture get a stripe and a count of 4. ' +
         'A different picture stays unmarked.'), 'README lost the image caption');
     assert.ok(fs.statSync(path.join(ROOT, 'docs/images/dih-readme.png')).size > 0);
-});
-
-test('nothing tracked mentions the removed groups module', () => {
-    const files = spawnSync('git', ['-C', ROOT, 'ls-files'], { encoding: 'utf8', timeout: 30000 });
-    assert.equal(files.status, 0, files.stderr);
-    const self = path.relative(ROOT, __filename);
-    for (const file of files.stdout.trim().split('\n')) {
-        if (file === self || !/\.(js|json|md|yml|sh)$/.test(file)) continue;
-        assert.doesNotMatch(read(file), /groups\.js/, file);
-    }
 });

@@ -2,7 +2,11 @@
  * Content script. Nothing runs until you click the toolbar button: the click
  * injects hash.js and then this file into the clicked tab's top frame only
  * (no iframes). Clicking again runs the observe pass again (a rescan); it does
- * not add a second observer or a second set of shortcuts.
+ * not add a second observer or a second set of shortcuts. Why top frame only:
+ * each frame is its own script instance, so comparing across frames would need
+ * a per-tab collector in the service worker, and injecting into every frame
+ * means running inside every advert and embed. Galleries keep their images in
+ * the top document.
  *
  * What counts as a duplicate:
  * - Two different image URLs whose 32x32 difference hashes (992 bits) are
@@ -10,6 +14,8 @@
  *   a duplicate.
  * - A new hash joins the first stored hash within 5 bits, in the order
  *   hashes arrive. Matches do not chain: A~B and B~C does not put A with C.
+ *   This is the original plugin's rule, kept on purpose, order dependence
+ *   included.
  * - Skipped: images with no src, data: URLs, and images whose natural size
  *   is not greater than 100x50 (naturalWidth > 100 and naturalHeight > 50).
  * - Skipped: hashes that are all 0 or all f (flat placeholders).
@@ -61,59 +67,55 @@
     const LOG_PREFIX = '[DuplicateImageHighlighter]';
     const DuplicateImageHash = window.DuplicateImageHash;
 
-    // --- CONFIGURATION ---
-
-    /**
-     * Hamming distance threshold for near-duplicate detection.
-     * - Lower = stricter matching (fewer false positives, may miss similar images)
-     * - Higher = looser matching (catches more duplicates, but may have false positives)
-     *
-     * With a 32x31 dHash (992 bits / 248 hex chars), typical thresholds:
-     * - 0: Exact match only
-     * - 5: Very similar images (compression artifacts, slight crops) [RECOMMENDED]
-     * - 10: Moderately similar (same scene, different quality)
-     * - 15+: Loose matching (may catch unrelated images)
-     */
     const HAMMING_THRESHOLD = 5;
 
-    /**
-     * Maximum number of entries to keep in memory maps.
-     * Prevents unbounded memory growth on infinite-scroll pages.
-     * When the limit is reached, the oldest entries are evicted.
-     */
+    // Caps on the maps, for infinite-scroll pages; the oldest entries go first.
     const MAX_CACHE_ENTRIES = 5000;
-
-    /**
-     * Maximum number of failed URLs to track.
-     * Prevents a memory leak if many images fail to load (404s, non-images, etc).
-     */
     const MAX_FAILED_ENTRIES = 1000;
 
-    // --- VISUAL STYLING ---
-
     /**
-     * Styles by duplicate count: blue at 2 copies, shading to red at 10 or more.
-     * Returns null for a count of 1 or less.
+     * Inline styles for a duplicate count (always > 1): the image's outline,
+     * the parent's stripe overlay and its count pill. Blue at 2 copies,
+     * shading to red at 10 or more, with stripes narrowing from 20px to 5px.
      */
-    function styleForCount(count) {
-        if (count <= 1) return null;
-
-        const maxCount = 10; // Cap at 10 for max redness
-        const t = (Math.min(count, maxCount) - 1) / (maxCount - 1); // 0..1
+    function decorationStyles(count) {
+        const t = (Math.min(count, 10) - 1) / 9;
         const hue = 200 - (200 * t);
-
-        // Wider stripes for a low count, tighter for a high one: 20px -> 5px
         const stripeWidth = 20 - (15 * t);
         const colorA = `hsla(${hue}, 100%, 50%, 0.3)`;
         const colorB = `hsla(${hue}, 100%, 50%, 0.05)`;
 
         return {
-            outline: `3px solid hsl(${hue}, 100%, 50%)`,
-            outlineOffset: '-4px',
-            backgroundImage: `repeating-linear-gradient(45deg, ${colorA}, ${colorA} 2px, ${colorB} 2px, ${colorB} ${stripeWidth}px)`,
-            badgeBg: `hsl(${hue}, 100%, 30%)`,
-            badgeColor: '#fff',
-            zIndex: 1000 + count
+            outline: {
+                outline: `3px solid hsl(${hue}, 100%, 50%)`,
+                outlineOffset: '-4px'
+            },
+            stripe: {
+                position: 'absolute',
+                top: '0',
+                left: '0',
+                width: '100%',
+                height: '100%',
+                backgroundImage: `repeating-linear-gradient(45deg, ${colorA}, ${colorA} 2px, ${colorB} 2px, ${colorB} ${stripeWidth}px)`,
+                pointerEvents: 'none',
+                zIndex: String(1000 + count - 1),
+                borderRadius: 'inherit'
+            },
+            pill: {
+                position: 'absolute',
+                top: '4px',
+                right: '4px',
+                backgroundColor: `hsl(${hue}, 100%, 30%)`,
+                color: '#fff',
+                padding: '2px 6px',
+                borderRadius: '12px',
+                fontSize: '12px',
+                fontWeight: 'bold',
+                fontFamily: 'sans-serif',
+                zIndex: String(1000 + count),
+                boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
+                pointerEvents: 'none'
+            }
         };
     }
 
@@ -136,38 +138,6 @@
         return Object.keys(styles).every((name) => el.style[name] === probe.style[name]);
     }
 
-    function stripeStyles(styles) {
-        return {
-            position: 'absolute',
-            top: '0',
-            left: '0',
-            width: '100%',
-            height: '100%',
-            backgroundImage: styles.backgroundImage,
-            pointerEvents: 'none',
-            zIndex: String(styles.zIndex - 1),
-            borderRadius: 'inherit'
-        };
-    }
-
-    function pillStyles(styles) {
-        return {
-            position: 'absolute',
-            top: '4px',
-            right: '4px',
-            backgroundColor: styles.badgeBg,
-            color: styles.badgeColor,
-            padding: '2px 6px',
-            borderRadius: '12px',
-            fontSize: '12px',
-            fontWeight: 'bold',
-            fontFamily: 'sans-serif',
-            zIndex: String(styles.zIndex),
-            boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
-            pointerEvents: 'none'
-        };
-    }
-
     /**
      * Marks an image as one of `count` look-alikes: outline on the image,
      * stripe overlay and count pill on its parent. Leaves whatever already
@@ -177,54 +147,39 @@
         const parent = img.parentElement;
         if (!parent) return;
 
-        const existingStripe = decorationOf(parent, 'dih-stripe');
-        const existingCount = decorationOf(parent, 'dih-count');
+        const styles = decorationStyles(count);
+        if (!hasStyles(img, styles.outline)) Object.assign(img.style, styles.outline);
 
-        if (count <= 1) {
-            if (existingCount) existingCount.remove();
-            if (existingStripe) existingStripe.remove();
-            img.style.outline = '';
-            return;
-        }
-
-        const styles = styleForCount(count);
-        const outline = { outline: styles.outline, outlineOffset: styles.outlineOffset };
-        if (!hasStyles(img, outline)) Object.assign(img.style, outline);
-
-        // The overlay and pill are positioned against the parent
         if (window.getComputedStyle(parent).position === 'static') {
             parent.style.position = 'relative';
         }
 
+        const existingStripe = decorationOf(parent, 'dih-stripe');
+        const existingCount = decorationOf(parent, 'dih-count');
         const title = `Duplicate: ${count} copies on this page`;
-        const stripeStyle = stripeStyles(styles);
-        const pillStyle = pillStyles(styles);
         if (existingStripe && existingCount &&
             existingCount.textContent === String(count) &&
             existingCount.getAttribute('title') === title &&
-            hasStyles(existingStripe, stripeStyle) &&
-            hasStyles(existingCount, pillStyle)) {
+            hasStyles(existingStripe, styles.stripe) &&
+            hasStyles(existingCount, styles.pill)) {
             return;
         }
 
-        // Replace the previous decoration
-        if (existingCount) existingCount.remove();
-        if (existingStripe) existingStripe.remove();
+        existingCount?.remove();
+        existingStripe?.remove();
 
         const stripe = document.createElement('div');
         stripe.className = 'dih-stripe';
-        Object.assign(stripe.style, stripeStyle);
+        Object.assign(stripe.style, styles.stripe);
         parent.appendChild(stripe);
 
         const pill = document.createElement('div');
         pill.className = 'dih-count';
         pill.textContent = String(count);
         pill.setAttribute('title', title);
-        Object.assign(pill.style, pillStyle);
+        Object.assign(pill.style, styles.pill);
         parent.appendChild(pill);
     }
-
-    // --- HASH MATCHING ---
 
     /**
      * The hash key a new hash belongs to: itself if already stored, otherwise
@@ -241,22 +196,15 @@
         return null;
     }
 
-    /**
-     * Flat placeholders hash to all 0 or all f bits.
-     */
+    // Flat placeholders hash to all 0 or all f bits.
     function isSolidColor(hash) {
-        if (!hash) return false;
-        return /^0+$/.test(hash) || /^f+$/.test(hash);
+        return /^(0+|f+)$/.test(hash);
     }
 
-    /**
-     * Get the effective source URL for an image (handles responsive images).
-     */
+    // currentSrc covers responsive images (srcset).
     function getImageSrc(img) {
         return img.currentSrc || img.src;
     }
-
-    // --- MEMORY ---
 
     // src URL -> hash key
     const processedSrcUrls = new Map();
@@ -319,19 +267,24 @@
         if (srcSet && srcSet.size > 1) markDuplicate(img, srcSet.size);
     }
 
-    // --- PAGE PROCESSING ---
+    /**
+     * Whether this URL needs no hashing: an image showing a URL already
+     * hashed is re-marked; one showing a URL that failed is left alone.
+     */
+    function alreadyHandled(img, src) {
+        if (processedSrcUrls.has(src)) {
+            remark(img, src);
+            return true;
+        }
+        return failedUrls.has(src);
+    }
 
     /**
      * Hash an image that came near the viewport and check it for duplicates.
      */
     function processImage(img) {
         const src = getImageSrc(img);
-
-        if (processedSrcUrls.has(src)) {
-            remark(img, src);
-            return;
-        }
-        if (failedUrls.has(src)) return;
+        if (alreadyHandled(img, src)) return;
 
         // Another image with this URL is already being hashed: share its result
         const pending = pendingHashes.get(src);
@@ -376,18 +329,12 @@
         return img.naturalWidth > 100 && img.naturalHeight > 50;
     }
 
-    // --- VIEWPORT-BASED PROCESSING ---
-
     // Images already handed to the IntersectionObserver
     const observedImages = new WeakSet();
 
     // The subset still waiting to come near the viewport
     const watchingImages = new Set();
 
-    /**
-     * Hash images as they approach the viewport, starting 500px before they
-     * become visible.
-     */
     const imageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
             if (!entry.isIntersecting) continue;
@@ -418,13 +365,7 @@
 
         for (const img of document.querySelectorAll('img')) {
             if (observedImages.has(img)) continue;
-
-            const src = getImageSrc(img);
-            if (processedSrcUrls.has(src)) {
-                remark(img, src);
-                continue;
-            }
-            if (failedUrls.has(src)) continue;
+            if (alreadyHandled(img, getImageSrc(img))) continue;
 
             observedImages.add(img);
             watchingImages.add(img);
@@ -432,12 +373,9 @@
         }
     }
 
-    // --- KEYBOARD SHORTCUTS ---
-
     window.addEventListener('keydown', (e) => {
         if (!e.altKey || !e.shiftKey) return;
 
-        // Alt + Shift + R = forget everything and reload
         if (e.code === 'KeyR') {
             console.log(`${LOG_PREFIX} Resetting...`);
             processedSrcUrls.clear();
@@ -446,39 +384,27 @@
             location.reload();
         }
 
-        // Alt + Shift + D = debug dump
         if (e.code === 'KeyD') {
             console.log(`${LOG_PREFIX} Debug dump`);
             console.log('Processed URLs:', processedSrcUrls.size);
             console.log('Unique hashes:', hashToSrcUrls.size);
             console.log('Failed URLs:', failedUrls.size);
 
-            const duplicates = [];
-            for (const [hash, srcSet] of hashToSrcUrls) {
-                if (srcSet.size > 1) {
-                    duplicates.push({
-                        hash: hash.substring(0, 16) + '...',
-                        count: srcSet.size,
-                        urls: Array.from(srcSet).map(u => u.substring(0, 60) + '...')
-                    });
-                }
-            }
+            const duplicates = [...hashToSrcUrls]
+                .filter(([, srcSet]) => srcSet.size > 1)
+                .map(([hash, srcSet]) => ({
+                    hash: hash.substring(0, 16) + '...',
+                    count: srcSet.size,
+                    urls: Array.from(srcSet).map(u => u.substring(0, 60) + '...')
+                }));
             console.table(duplicates);
         }
 
-        // Alt + Shift + S = rescan now
         if (e.code === 'KeyS') {
             console.log(`${LOG_PREFIX} Manual rescan triggered`);
             observeNewImages();
         }
     });
-
-    // --- PAGE CHANGES (infinite scroll, SPAs) ---
-
-    function isOwnDecoration(node) {
-        return Boolean(node.classList) &&
-            (node.classList.contains('dih-stripe') || node.classList.contains('dih-count'));
-    }
 
     /**
      * A change that only adds or removes our own stripes and pills. Two images
@@ -487,9 +413,11 @@
      */
     function isOwnDecorationChange(mutation) {
         const nodes = [...mutation.addedNodes, ...mutation.removedNodes];
-        return nodes.length > 0 && nodes.every(isOwnDecoration);
+        return nodes.length > 0 && nodes.every((node) =>
+            node.classList?.contains('dih-stripe') || node.classList?.contains('dih-count'));
     }
 
+    // Infinite scroll and single-page apps add images after the first pass.
     let debounceTimer = null;
     const domObserver = new MutationObserver((mutations) => {
         if (mutations.every(isOwnDecorationChange)) return;

@@ -2,15 +2,17 @@
  * Service worker.
  *
  * 1. Toolbar click: injects the hasher and the page script into the clicked
- *    tab's top frame. Nothing runs on a page until you click. Clicking again
- *    rescans.
+ *    tab's top frame. The manifest has no content_scripts, so nothing runs on
+ *    a page you did not ask about and there are no site patterns to maintain.
+ *    Clicking again rescans.
  * 2. Image fetch: content scripts cannot read pixels from cross-origin images
  *    (the canvas is tainted), so they ask the service worker to fetch the
- *    image and hand it back as a data URL.
+ *    image and hand it back as a data URL. That is why the extension needs
+ *    http(s) host access.
  *
  * Why the fetch is hardened (no cookies, http(s) only, image types, 15s,
- * 20MB): a public extension that runs on any page you click cannot use an
- * unbounded fetch that carries your cookies to whatever URL the page names.
+ * 20MB): a click can point it at any page, and an unbounded fetch carrying
+ * your cookies to whatever URL the page names is not acceptable.
  */
 
 const IMAGE_FETCH_MAX_BYTES = 20 * 1024 * 1024;
@@ -39,20 +41,16 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    // Only accept messages from our own content script running in a tab.
-    if (sender.id !== chrome.runtime.id || !sender.tab) return false;
+    // Only our own content script, running in a tab, asking for an image.
+    if (sender.id !== chrome.runtime.id || !sender.tab || request.action !== 'FETCH_IMAGE_BLOB') return false;
 
-    if (request.action === 'FETCH_IMAGE_BLOB') {
-        fetchImageAsDataUrl(request.url)
-            .then(dataUrl => sendResponse({ success: true, dataUrl }))
-            .catch(error => {
-                console.warn('[DuplicateImageHighlighter] Fetch failed:', request.url, error.message);
-                sendResponse({ success: false, error: error.toString() });
-            });
-        return true; // Keep the message channel open for the async response
-    }
-
-    return false;
+    fetchImageAsDataUrl(request.url)
+        .then(dataUrl => sendResponse({ success: true, dataUrl }))
+        .catch(error => {
+            console.warn('[DuplicateImageHighlighter] Fetch failed:', request.url, error.message);
+            sendResponse({ success: false, error: error.toString() });
+        });
+    return true; // Keep the message channel open for the async response
 });
 
 /**

@@ -1,43 +1,23 @@
 /**
- * Perceptual hashing module (dHash), exposed as window.DuplicateImageHash.
- *
- * Uses the "difference hash" algorithm:
- * 1. Resize the image to a small square (32x32)
- * 2. Compare the brightness of horizontally adjacent pixels
- * 3. Emit one bit per comparison
- *
- * The hash is resilient to:
- * - Image resizing
- * - Minor color adjustments
- * - Compression artifacts
+ * Perceptual hashing (dHash), exposed as window.DuplicateImageHash. An image
+ * is drawn at 32x32 and each pixel's brightness is compared with its right
+ * neighbour's: 32 rows x 31 comparisons = 992 bits (248 hex chars). The hash
+ * survives resizing, small color changes and compression artifacts.
  */
 (function () {
     // Clicking the toolbar button again re-injects this file; keep the first instance.
     if (window.DuplicateImageHash) return;
 
-    // --- CONFIG ---
-
-    /**
-     * Target size for image resizing before hashing.
-     * 32x32 provides a good balance of accuracy vs performance.
-     * Produces a 32x31 = 992 bit hash (248 hex characters).
-     */
     const TARGET_SIZE = 32;
 
-    /**
-     * Maximum concurrent hash operations.
-     * Stays under the browser's ~6 concurrent connections per origin.
-     */
+    // Stays under the browser's ~6 concurrent connections per origin.
     const MAX_CONCURRENT = 5;
 
-    // Reuse a single canvas to save memory
     const canvas = document.createElement('canvas');
     canvas.width = TARGET_SIZE;
     canvas.height = TARGET_SIZE;
-    // Optimize for pixel reading
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-    // Queue system
     const queue = [];
     let activeCount = 0;
 
@@ -53,31 +33,24 @@
     }
 
     function processQueue() {
-        // Process up to MAX_CONCURRENT items simultaneously
         while (activeCount < MAX_CONCURRENT && queue.length > 0) {
             activeCount++;
             const task = queue.shift();
 
             computeHashInternal(task.url)
-                .then(hash => task.resolve(hash))
+                .then(task.resolve)
                 .catch(err => {
                     console.warn('[DuplicateImageHighlighter] Hash failed:', err);
                     task.resolve(null);
                 })
                 .finally(() => {
                     activeCount--;
-                    processQueue(); // Fill the freed slot
+                    processQueue();
                 });
         }
     }
 
-    /**
-     * Steps:
-     * 1. Ask the service worker to fetch the image (cross-origin pixels).
-     * 2. Decode it.
-     * 3. Draw it onto the cleared 32x32 canvas.
-     * 4. Compute the dHash.
-     */
+    // The service worker fetches the image, since a cross-origin image would taint the canvas.
     async function computeHashInternal(url) {
         const dataUrl = await fetchImageViaBackground(url);
         if (!dataUrl) return null;
@@ -101,17 +74,13 @@
      * right-hand neighbour's.
      */
     function dHashFromPixels(pixels, size) {
+        const brightness = (i) => (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
         let bits = '';
 
         for (let y = 0; y < size; y++) {
             for (let x = 0; x < size - 1; x++) {
-                const iA = (y * size + x) * 4;
-                const bA = (pixels[iA] + pixels[iA + 1] + pixels[iA + 2]) / 3;
-
-                const iB = (y * size + (x + 1)) * 4;
-                const bB = (pixels[iB] + pixels[iB + 1] + pixels[iB + 2]) / 3;
-
-                bits += (bA > bB) ? '1' : '0';
+                const i = (y * size + x) * 4;
+                bits += brightness(i) > brightness(i + 4) ? '1' : '0';
             }
         }
 
@@ -120,7 +89,7 @@
 
     function fetchImageViaBackground(url) {
         return new Promise((resolve) => {
-            chrome.runtime.sendMessage({ action: 'FETCH_IMAGE_BLOB', url: url }, (response) => {
+            chrome.runtime.sendMessage({ action: 'FETCH_IMAGE_BLOB', url }, (response) => {
                 if (chrome.runtime.lastError || !response || !response.success) {
                     resolve(null);
                 } else {
@@ -143,8 +112,7 @@
         try {
             return await createImageBitmap(dataUrlToBlob(dataUrl));
         } catch (bitmapErr) {
-            // Not decodable as a bitmap (SVG): try the data URL. If that fails
-            // too, report both causes; an Image error event carries no message.
+            // If the Image fails too, report both causes; an Image error event carries no message.
             try {
                 return await loadImage(dataUrl);
             } catch (imageErr) {
